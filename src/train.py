@@ -47,6 +47,7 @@ def fit(
     device: torch.device,
     epochs: int = 10,
 ):
+    train_losses, val_losses = [], []
 
     pbar = tqdm(total=epochs, desc="Training", unit="iter")
 
@@ -54,15 +55,18 @@ def fit(
         desc = f"Epoch {epoch}/{epochs}"
         # Train
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
-
+        train_losses.append(train_loss)
 
         # Validate
         val_loss   = validate(model, val_loader, criterion, device)
+        val_losses.append(val_loss)
 
         pbar.update(1)
-        if epoch % 10 == 0:
+        if epoch % 50 == 0:
             pbar.set_postfix(iter=epoch, loss=f"{train_loss:.4f}")
             pbar.write(f"[Iter {epoch:4d}] validation loss: {val_loss:.4f}")
 
         #print(f"{desc} — train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f}")
     pbar.close()
+    
+    return train_losses, val_losses
