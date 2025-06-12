@@ -17,6 +17,7 @@ if __name__ == "__main__":
     input_dim    = 28 * 28
     hidden_dims  = [128, 64]
     output_dim   = 1
+    dropout_rate = 0.2
     lr           = 1e-3
     epochs       = 100
     val_fraction = 0.2 
@@ -37,7 +38,7 @@ if __name__ == "__main__":
     val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False)
 
     # model, optimizer, loss function
-    model     = SimpleMLP(input_dim, hidden_dims, output_dim).to(device)
+    model     = SimpleMLP(input_dim, hidden_dims, output_dim, dropout_rate).to(device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = MSELoss()
 
