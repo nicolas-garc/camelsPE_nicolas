@@ -62,7 +62,7 @@ def fit(
         val_losses.append(val_loss)
 
         pbar.update(1)
-        if epoch % 50 == 0:
+        if epoch % 500 == 0:
             pbar.set_postfix(iter=epoch, loss=f"{train_loss:.4f}")
             pbar.write(f"[Iter {epoch:4d}] validation loss: {val_loss:.4f}")
 
