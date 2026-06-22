@@ -1,0 +1,11 @@
+# Direct dependencies used by the Python modules and notebooks.
+h5py
+ipykernel
+matplotlib
+numpy
+optuna
+pandas
+scikit-learn
+seaborn
+torch
+tqdm
