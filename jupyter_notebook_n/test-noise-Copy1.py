@@ -776,10 +776,10 @@ ax = sns.heatmap(
     center=0.0,
     linewidths=0.3,
     vmin = -0.5,
-    cbar_kws={"label": "ΔR² (Original - Shifted)"}
+    cbar_kws={"label": "ΔR² (Shifted − Original);  negative = information lost"}
 )
 
-plt.title("Drop in R² from Shuffling 2nd Observables and using 1st Observable 'Truth' ")
+plt.title("Change in R² (Shifted − Original) from Shuffling 2nd Observable, using 1st Observable 'Truth'")
 plt.xlabel("Cosmological/Feedback Parameter")
 plt.ylabel("Noise/Shift Case")
 plt.tight_layout()
@@ -935,10 +935,10 @@ ax = sns.heatmap(
     center=0.0,
     linewidths=0.3,
     vmin = -0.5,
-    cbar_kws={"label": "ΔR² (Original - Shifted)"}
+    cbar_kws={"label": "ΔR² (Shifted − Original);  negative = information lost"}
 )
 
-plt.title("Drop in R² from Shuffling 2nd Observables and using 2nd Observable 'Truth' ")
+plt.title("Change in R² (Shifted − Original) from Shuffling 2nd Observable, using 2nd Observable 'Truth'")
 plt.xlabel("Cosmological/Feedback Parameter")
 plt.ylabel("Noise/Shift Case")
 plt.tight_layout()
@@ -973,8 +973,9 @@ for i, case in enumerate(cases):
         })
 
 dual_r2_df = pd.DataFrame(rows)
-dual_r2_df["delta_obs1"] = dual_r2_df["r2_aligned"] - dual_r2_df["r2_shuf_obs1"]
-dual_r2_df["delta_obs2"] = dual_r2_df["r2_aligned"] - dual_r2_df["r2_shuf_obs2"]
+# shifted − original, matching the ΔR² heatmaps above: negative = information lost
+dual_r2_df["delta_obs1"] = dual_r2_df["r2_shuf_obs1"] - dual_r2_df["r2_aligned"]
+dual_r2_df["delta_obs2"] = dual_r2_df["r2_shuf_obs2"] - dual_r2_df["r2_aligned"]
 
 # %%
 import re
