@@ -276,16 +276,20 @@ separate_models = False
 
 # %%
 n_val = int(len(x_clean_tensor) * val_fraction)
-perm = torch.randperm(len(x_clean_tensor))
-idx_train = perm[:-n_val]
-idx_val = perm[-n_val:]
+# named split_perm, not perm: the shuffle perm below is a *different* permutation and
+# several plot helpers read `perm` off globals(). Sharing the name meant re-running this
+# cell last left `perm` at length len(x_clean_tensor), and those helpers would quietly
+# fall back to a fresh permutation instead of the one the R2 loops used.
+split_perm = torch.randperm(len(x_clean_tensor))
+idx_train = split_perm[:-n_val]
+idx_val = split_perm[-n_val:]
 
 x_val, y_val = x_clean_tensor[idx_val], y[idx_val]
 val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=64, shuffle=False)
 
 # %%
-#we randomize the indices of the validation set 
-
+#we randomize the indices of the validation set
+# keep this one named `perm`: the plot helpers look it up via globals().get("perm")
 perm = np.random.permutation(len(idx_val))
 
 # %%
