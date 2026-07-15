@@ -233,10 +233,25 @@ def shuffle_observable(obs_dict,keys_to_shift, perm):
 
 
 # %%
-def add_noise(array_np, noise_level=0.0):
-    noise = np.random.normal(loc=0.0, scale=noise_level, size=array_np.shape)
-    array_np += noise
-    return array_np  
+def add_noise_and_normalize(array_np, noise_level=0.0):
+    """Degrade an observable with Gaussian noise, in units of each bin's std.
+
+    The renormalize at the end is what makes noise_level mean "information
+    destroyed" and nothing else. Adding noise without it left the noisy training
+    inputs at std sqrt(1 + noise_level**2) while validation stayed at std 1 --
+    a 5x scale gap at noise_level=5 -- so the observable was suppressed at
+    validation by attenuation on top of the information loss. Renormalizing puts
+    train and val on the same scale for identical information loss.
+
+    Not in-place: `array_np + noise` rebinds rather than mutating the caller's
+    array, so this can never corrupt x_normalized_dict.
+    """
+    if noise_level > 0:
+        std = np.std(array_np, axis=0)
+        array_np = array_np + np.random.normal(0.0, noise_level * std, array_np.shape)
+    mean = np.mean(array_np, axis=0)
+    std = np.std(array_np, axis=0)
+    return (array_np - mean) / std
 
 
 # %%
@@ -322,7 +337,7 @@ def make_train_loader_fn(selected_observables, x_dict, y_vector, idx_train, batc
         for key in sorted(selected_observables.keys()):
             noise_level = selected_observables[key]
             arr = x_dict[key][idx_train]  # Subset training samples
-            x_proc = add_noise(arr, noise_level)  # Add noise and normalize
+            x_proc = add_noise_and_normalize(arr, noise_level)  # noise, then back to std 1
             x_list.append(torch.from_numpy(x_proc).float())
 
         x_epoch = torch.cat(x_list, dim=1)
