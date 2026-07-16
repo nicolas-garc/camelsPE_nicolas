@@ -238,13 +238,23 @@ def add_noise(array_np, noise_level=0.0):
     std 1, so noise_level is in units of that std.
 
     DELIBERATELY does not renormalize afterwards -- do not "fix" this.
-    Noise leaves the training input at std sqrt(1 + noise_level**2) while the
-    validation input stays clean at std 1. The model therefore learns first-layer
-    weights for the inflated scale and sees a much smaller input at validation, so
-    a noisy observable is attenuated on top of losing information. That harsher
-    suppression is the intended behaviour: it is what drives one observable's
-    information to dominate. Renormalizing here holds train and val at the same
-    scale and degrades too gently.
+    The signal component inside the training input (x + n) is x, at std 1, which
+    is exactly what the clean validation input feeds. So train and val agree on
+    the signal pathway, and the noisy channel's contribution at validation shrinks
+    by the reliability factor 1/(1+noise_level**2) -- precisely the diminished
+    dependence the network was able to learn from the noisy channel.
+
+    Renormalizing after the noise (dividing by sqrt(1+noise_level**2)) shrinks the
+    signal component inside the training input, while validation still feeds the
+    full-strength clean x. The learned weight then meets a signal
+    sqrt(1+noise_level**2) times larger than it was calibrated on, re-inflating
+    the very channel the noise is meant to degrade; suppression weakens to
+    1/sqrt(1+noise_level**2) and the degradation stops being robust. This was
+    tried and rejected.
+
+    Caveat: the argument above is exact for a linear readout; with ReLU layers the
+    train/val input-scale difference also shifts the nonlinear operating regime.
+    No norm layers in SimpleMLP, so the linear story dominates in practice.
 
     Not in-place: `array_np + noise` rebinds instead of mutating, so passing an
     unindexed array can't corrupt x_normalized_dict. Numerically identical to the
