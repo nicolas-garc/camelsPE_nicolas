@@ -169,22 +169,23 @@ x_raw_dict = {key: observable_block[key].numpy() for key in all_observables}
 
 # %%
 
-# ============================ SET THIS PER ANALYSIS ============================
-# The pair under comparison — the single source of truth. Every loop and plot below
-# resolves through these two names, so switching the pair is a one-line edit here.
+# The pair under comparison. Derived from sorted(all_observables) so it matches the
+# column layout the model sees: the loader concatenates observables in sorted order
+# (see x_clean_concat below and make_val_loader_fn), so obs1/obs2 pick up whichever
+# names come first/second in that same order. Changing which observables are in
+# noise_cases automatically propagates here -- no separate edit needed.
 #
-# observable_2 is THE ONE THAT GETS SHUFFLED in both comparisons:
-#   obs1_vs_truth -> shuffle observable_2, truths stay with observable_1
-#                    R2 survives only if the model reads observable_1
-#   obs2_vs_truth -> shuffle observable_2 and truths together
-#                    R2 survives only if the model reads observable_2
-# So set observable_2 to the observable whose information you want to destroy.
+# obs1 = "leftmost feature block", obs2 = "next feature block". Under the current
+# noise_cases (Ms_Mh_s61, SFR_Ms_s61), sorted() gives obs1=Ms_Mh_s61, obs2=SFR_Ms_s61.
 #
-# Don't derive these from all_observables: it's a set, so list(...)[0]/[1] swapped
-# them between kernel restarts; sorted() is stable but alphabetical, not your intent.
-observable_1 = "Ms_Mh_s61"
-observable_2 = "SFR_Ms_s61"
-# ===============================================================================
+# NOTE: sorted() is alphabetical, not case-name-order. If a future noise_cases dict
+# uses e.g. "sfr_5_ms_0" -> {"SFR_Ms_s61": 5, "Ms_Mh_s61": 0}, the case NAMES read
+# sfr-then-ms while sorted() puts Ms first. That's a naming convention drift, not a
+# pipeline inconsistency -- the model still sees columns in sorted order regardless.
+_sorted_obs = sorted(all_observables)
+if len(_sorted_obs) < 2:
+    raise ValueError(f"need at least two observables in noise_cases; got {_sorted_obs}")
+observable_1, observable_2 = _sorted_obs[0], _sorted_obs[1]
 
 for name in (observable_1, observable_2):
     if name not in all_observables:
