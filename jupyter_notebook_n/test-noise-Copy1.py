@@ -641,7 +641,15 @@ for result_idx, result in enumerate(all_results):
 
     shuffle = resolve_shuffle(selected_observables, "obs1_vs_truth")
     if shuffle is None:
-        print(f"Skipping {case_name}: no {observable_2} to shuffle in this case")
+        # observable_2 isn't in this case's inputs, so the shuffle-obs2 op is a no-op:
+        # nothing gets permuted and the "shuffled" R2 is identical to the aligned one.
+        # Copy aligned rather than skip -- keeps single-observable reference cases in
+        # the heatmap instead of blank rows. DO NOT drop this branch: without it, the
+        # S2 loop's shuffle_y=True still scrambles the truths while nothing shuffles in
+        # the input, producing a large-negative R2 that looks like a real result but
+        # is only the label mismatch.
+        print(f"{case_name}: no {observable_2} to shuffle -> shuffled R2 = aligned R2")
+        r2_matrix_shifted_observable_only[result_idx] = r2_matrix[result_idx]
         continue
     keys_to_shuffle, shuffle_y = shuffle
 
@@ -811,7 +819,11 @@ for result_idx, result in enumerate(all_results):
 
     shuffle = resolve_shuffle(selected_observables, "obs2_vs_truth")
     if shuffle is None:
-        print(f"Skipping {case_name}: no {observable_2} to shuffle in this case")
+        # Same reasoning as the S1 loop above: observable_2 not in this case ->
+        # nothing to shuffle -> R2 equals the aligned reference. Keeps the row in
+        # the heatmap. DO NOT drop this branch (see the S1 note).
+        print(f"{case_name}: no {observable_2} to shuffle -> shuffled R2 = aligned R2")
+        r2_matrix_shifted_both[result_idx] = r2_matrix[result_idx]
         continue
     keys_to_shuffle, shuffle_y = shuffle
 
