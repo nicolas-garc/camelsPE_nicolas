@@ -198,24 +198,38 @@ print(f"Observable 2: {observable_2}")
 def resolve_shuffle(selected_observables, mode):
     """Which observables to shuffle, and whether the truths follow them.
 
-    Both comparisons shuffle observable_2 — only the truth alignment differs, which is
-    what isolates who carries the information:
+    Both comparisons shuffle observable_2 mechanically. Under the dual framing,
+    each mode has a natural ANCHOR — the observable that is retained (not
+    scrambled) and whose truth we compare predictions against:
       "aligned"       nothing shuffled (reference)
       "obs1_vs_truth" shuffle observable_2, truths stay with observable_1
+                      anchor = observable_1
                       -> R2 survives only if the model reads observable_1
-      "obs2_vs_truth" shuffle observable_2 and truths together, truths follow observable_2
+      "obs2_vs_truth" shuffle observable_2 and truths together (equivalently:
+                      shuffle observable_1, truths stay with observable_2)
+                      anchor = observable_2
                       -> R2 survives only if the model reads observable_2
 
-    Returns (keys_to_shuffle, shuffle_y), or None if this case has no observable_2
-    to shuffle (e.g. single-observable reference cases).
+    Returns (keys_to_shuffle, shuffle_y), or None if the ANCHOR is absent from
+    this case. Without the anchor, the test isn't asking a meaningful question
+    ("does the model rely on X" when X isn't in the model's inputs), so the
+    caller should treat those cases as aligned.
+
+    When the anchor is present but the shuffled key isn't (e.g. ms_clean under
+    obs1_vs_truth: anchor obs1 is present, but obs2 is not), keys_to_shuffle is
+    the empty set: the loader's shuffle then becomes a natural no-op and R2
+    comes out equal to aligned. The make_val_loader_fn guard is happy with an
+    empty key set.
     """
     if mode == "aligned":
         return set(), False
-    if observable_2 not in selected_observables:
-        return None
     if mode == "obs1_vs_truth":
-        return {observable_2}, False
+        if observable_1 not in selected_observables:
+            return None
+        return {observable_2} & set(selected_observables), False
     if mode == "obs2_vs_truth":
+        if observable_2 not in selected_observables:
+            return None
         return {observable_2}, True
     raise ValueError(f"Unknown mode: {mode!r}")
 
@@ -641,14 +655,11 @@ for result_idx, result in enumerate(all_results):
 
     shuffle = resolve_shuffle(selected_observables, "obs1_vs_truth")
     if shuffle is None:
-        # observable_2 isn't in this case's inputs, so the shuffle-obs2 op is a no-op:
-        # nothing gets permuted and the "shuffled" R2 is identical to the aligned one.
-        # Copy aligned rather than skip -- keeps single-observable reference cases in
-        # the heatmap instead of blank rows. DO NOT drop this branch: without it, the
-        # S2 loop's shuffle_y=True still scrambles the truths while nothing shuffles in
-        # the input, producing a large-negative R2 that looks like a real result but
-        # is only the label mismatch.
-        print(f"{case_name}: no {observable_2} to shuffle -> shuffled R2 = aligned R2")
+        # obs1_vs_truth's anchor is observable_1, and it's absent from this case
+        # (e.g. sfr_clean). The test "does the model read observable_1" isn't
+        # meaningful when observable_1 isn't in the model, so treat as aligned
+        # and keep the case in the heatmap instead of dropping the row.
+        print(f"{case_name}: no {observable_1} (anchor) in this case -> shuffled R2 = aligned R2")
         r2_matrix_shifted_observable_only[result_idx] = r2_matrix[result_idx]
         continue
     keys_to_shuffle, shuffle_y = shuffle
@@ -819,10 +830,12 @@ for result_idx, result in enumerate(all_results):
 
     shuffle = resolve_shuffle(selected_observables, "obs2_vs_truth")
     if shuffle is None:
-        # Same reasoning as the S1 loop above: observable_2 not in this case ->
-        # nothing to shuffle -> R2 equals the aligned reference. Keeps the row in
-        # the heatmap. DO NOT drop this branch (see the S1 note).
-        print(f"{case_name}: no {observable_2} to shuffle -> shuffled R2 = aligned R2")
+        # obs2_vs_truth's anchor is observable_2, and it's absent from this case
+        # (e.g. ms_clean). DO NOT drop this branch: without it the S2 loop's
+        # shuffle_y=True still scrambles the truths while nothing shuffles in
+        # the input, producing a fake large-negative R2 that reads like a real
+        # signal but is only the label mismatch.
+        print(f"{case_name}: no {observable_2} (anchor) in this case -> shuffled R2 = aligned R2")
         r2_matrix_shifted_both[result_idx] = r2_matrix[result_idx]
         continue
     keys_to_shuffle, shuffle_y = shuffle
