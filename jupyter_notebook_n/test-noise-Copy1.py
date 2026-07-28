@@ -4545,6 +4545,265 @@ def plot_bias_progression_overlay(param,
 
 
 # %%
+def plot_directional_pull_by_true(param,
+                                    *,
+                                    case_sequence=None,
+                                    obs_pair=None,
+                                    results=None,
+                                    param_labels=None,
+                                    n_bins=15,
+                                    min_per_bin=5,
+                                    figsize=(9, 6.5),
+                                    perm=None,
+                                    save_path=None):
+    """
+    Per-simulation directional pull vs bin-conditional accuracy, aggregated by
+    true parameter value.
+
+    For each val simulation j across the ordered case sequence, computes:
+      - pull_j     = slope of pred_case_j regressed on sequence position.
+                     SIGN = direction (positive: predictions increased along the
+                     sequence from clean_left toward clean_right; negative: the
+                     opposite). MAGNITUDE = strength of that directional pull.
+      - error_j    = median over cases of |pred_case_j - true_j|. Unsigned
+                     accuracy floor for that sim.
+
+    Then bins both by the sim's true θ. In each bin plots:
+      - solid line: mean(pull_j) ± SE ribbon.  Above 0 = pulled up in this bin;
+        below 0 = pulled down.
+      - grey band: ±mean(error_j) around 0.  This is the accuracy envelope —
+        the pull needs to exit this band to be credible; a pull line inside the
+        band means the shift is smaller than typical prediction error for sims
+        in that bin.
+      - top marginal: histogram of true θ using the same bin edges.
+
+    Reads: does the direction of pull differ between edge bins and middle bins
+    (does the parameter range change how observables disagree)? And where does
+    that pull exceed the model's typical error (credible) vs stay inside it
+    (drowned in noise)?
+
+    Sequence position is uniform (0, 1, ..., n-1) along dual_clean_asym_order
+    -- the case sequence is a conceptual ramp, not a numeric axis, so we don't
+    try to space cases by noise level.
+
+    Generalizes to any observable pair in results (same resolution logic as
+    plot_bias_progression_overlay). Only aligned-mode predictions are pulled;
+    truth agreement across cases is verified so the "true θ on x-axis" is
+    unambiguous.
+
+    Returns (fig, stats) with per-sim pull_j / error_j arrays and per-bin
+    aggregates.
+    """
+    if results is None:
+        results = all_results
+
+    # ---- parameter index (same resolver as sibling function)
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range (0..{output_dim-1}).")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    # ---- resolve case sequence + obs_pair (mirrors plot_bias_progression_overlay)
+    case_to_result = {r["case_name"]: r for r in results}
+    if case_sequence is None:
+        combo_pairs = set()
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo":
+                combo_pairs.add(frozenset((info["obs1"], info["obs2"])))
+        if obs_pair is None:
+            if not combo_pairs:
+                raise ValueError("No combo cases in results; cannot auto-detect an observable pair.")
+            if len(combo_pairs) > 1:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"Multiple observable pairs found in results: {pretty}. "
+                    f"Pass obs_pair=(obsA, obsB) to disambiguate."
+                )
+            obs_pair = tuple(sorted(next(iter(combo_pairs))))
+        else:
+            wanted = frozenset(obs_pair)
+            if wanted not in combo_pairs:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"obs_pair={tuple(obs_pair)} not found in combo cases. Available pairs: {pretty}."
+                )
+            obs_pair = tuple(obs_pair)
+        obs_set = set(obs_pair)
+        filtered = []
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and {info["obs1"], info["obs2"]} == obs_set:
+                filtered.append(c)
+            elif info["kind"] == "single" and info["obs"] in obs_set:
+                filtered.append(c)
+        ordered_all, split_idx = dual_clean_asym_order(filtered)
+        case_sequence = ordered_all[:split_idx]
+    else:
+        case_sequence = list(case_sequence)
+        if obs_pair is None:
+            for c in case_sequence:
+                info = parse_case_name(c)
+                if info["kind"] == "combo":
+                    obs_pair = (info["obs1"], info["obs2"])
+                    break
+
+    if not case_sequence:
+        raise ValueError("Resolved case_sequence is empty -- nothing to plot.")
+    if len(case_sequence) < 2:
+        raise ValueError(f"Need at least 2 cases to compute a directional slope; got {case_sequence}.")
+    missing = [c for c in case_sequence if c not in case_to_result]
+    if missing:
+        raise ValueError(f"Cases not found in results: {missing}")
+
+    # ---- collect predictions, verify aligned-mode truth agreement
+    n_cases = len(case_sequence)
+    preds_by_case = np.zeros((n_cases, 0))       # placeholder; sized on first case
+    true_ref = None
+    for k, c in enumerate(case_sequence):
+        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm)
+        yp = preds[:, p_idx]
+        yt = trues[:, p_idx]
+        if true_ref is None:
+            true_ref = yt
+            preds_by_case = np.zeros((n_cases, len(yp)))
+        else:
+            if not np.allclose(yt, true_ref, rtol=1e-8, atol=1e-8):
+                raise ValueError(
+                    f"Truths for case {c!r} do not match the first case's truths row-for-row. "
+                    f"get_case_predictions(mode='aligned') should share idx_val across cases."
+                )
+        preds_by_case[k] = yp
+
+    n_sims = preds_by_case.shape[1]
+    # sequence position: uniform 0..n_cases-1
+    pos = np.arange(n_cases, dtype=float)
+    pos_c = pos - pos.mean()                     # centered for numeric stability
+    denom = float((pos_c * pos_c).sum())
+    if denom == 0.0:
+        raise ValueError("Sequence has zero variance in position -- cannot compute slope.")
+
+    # per-sim signed pull: least-squares slope of pred vs sequence position
+    pred_c = preds_by_case - preds_by_case.mean(axis=0, keepdims=True)
+    pull = (pos_c[:, None] * pred_c).sum(axis=0) / denom      # shape (n_sims,)
+    # per-sim accuracy: median |pred - true| across cases
+    abs_err = np.abs(preds_by_case - true_ref[None, :])
+    error = np.median(abs_err, axis=0)                        # shape (n_sims,)
+
+    # ---- bin by true value
+    lo, hi = float(true_ref.min()), float(true_ref.max())
+    edges = np.linspace(lo, hi, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_idx = np.clip(np.digitize(true_ref, edges) - 1, 0, n_bins - 1)
+
+    mean_pull = np.full(n_bins, np.nan)
+    se_pull   = np.full(n_bins, np.nan)
+    mean_err  = np.full(n_bins, np.nan)
+    counts    = np.zeros(n_bins, dtype=int)
+    for b in range(n_bins):
+        m = bin_idx == b
+        n = int(m.sum())
+        counts[b] = n
+        if n >= min_per_bin:
+            pj = pull[m]; ej = error[m]
+            mean_pull[b] = pj.mean()
+            se_pull[b]   = pj.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+            mean_err[b]  = ej.mean()
+
+    # ---- figure
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 4], hspace=0.06)
+    ax_hist = fig.add_subplot(gs[0])
+    ax_main = fig.add_subplot(gs[1], sharex=ax_hist)
+
+    ax_hist.hist(true_ref, bins=edges, color="#B4B2A9", edgecolor="none")
+    ax_hist.set_yticks([])
+    for side in ("top", "right", "left"):
+        ax_hist.spines[side].set_visible(False)
+    ax_hist.tick_params(axis="x", labelbottom=False)
+
+    # accuracy envelope: grey ±error band around zero
+    good = ~np.isnan(mean_err)
+    ax_main.fill_between(centers[good], -mean_err[good], mean_err[good],
+                         color="#B4B2A9", alpha=0.35, linewidth=0,
+                         label="±median |pred − true| (accuracy floor)")
+
+    ax_main.axhline(0.0, color="k", ls="--", lw=0.8, alpha=0.6)
+
+    # pull line + SE ribbon
+    good_p = ~np.isnan(mean_pull)
+    ax_main.fill_between(centers[good_p],
+                         (mean_pull - se_pull)[good_p], (mean_pull + se_pull)[good_p],
+                         color="#3C3489", alpha=0.25, linewidth=0)
+    ax_main.plot(centers[good_p], mean_pull[good_p], "-", color="#3C3489",
+                 lw=2.2, marker="o", ms=4, label="mean directional pull")
+
+    # mark bins where |pull| exceeds accuracy floor (credible directional pull)
+    credible = np.abs(mean_pull) > mean_err
+    if credible.any():
+        ax_main.plot(centers[credible], mean_pull[credible], "o",
+                     mfc="none", mec="#791F1F", mew=1.6, ms=10, zorder=5,
+                     label="|pull| > accuracy floor")
+
+    ax_main.set_xlabel(f"True {p_label} (physical space)")
+    ax_main.set_ylabel(f"Directional pull   ({p_label} / case-step)")
+    ax_main.grid(alpha=0.25)
+    ax_main.legend(fontsize=8, loc="best", framealpha=0.9)
+
+    pair_str = f"{obs_pair[0]} ↔ {obs_pair[1]}" if obs_pair else "unknown pair"
+    seq_str = f"{case_sequence[0]} → {case_sequence[-1]}"
+    ax_hist.set_title(
+        f"Directional pull for {p_label}\n"
+        f"observables: {pair_str}   |   sequence: {seq_str}   ({n_cases} cases)",
+        fontsize=11
+    )
+
+    annot = ("sign of pull = direction predictions moved along the sequence\n"
+             "(positive: later cases predict higher than earlier)\n"
+             "|pull| < grey band → smaller than typical prediction error")
+    ax_main.text(0.02, 0.98, annot, transform=ax_main.transAxes,
+                 va="top", ha="left", fontsize=8, color="#3C3489",
+                 bbox=dict(facecolor="white", edgecolor="#B4B2A9",
+                          alpha=0.9, boxstyle="round,pad=0.4"))
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case_sequence": case_sequence,
+        "obs_pair": obs_pair,
+        "sequence_position": pos,
+        "per_sim_pull": pull,
+        "per_sim_error": error,
+        "per_sim_true": true_ref,
+        "bin_edges": edges,
+        "bin_centers": centers,
+        "bin_counts": counts,
+        "bin_mean_pull": mean_pull,
+        "bin_se_pull": se_pull,
+        "bin_mean_error": mean_err,
+    }
+    return fig, stats
+
+
+# %%
 figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
 for p_label, fig in figs_by_param.items():
     plt.show()
