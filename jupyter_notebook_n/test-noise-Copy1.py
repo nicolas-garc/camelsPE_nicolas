@@ -4295,17 +4295,19 @@ def plot_bias_progression_overlay(param,
         a universal negative slope because MSE minimization shrinks predictions
         toward the prior mean; the slope steepness is diagnostic of how weakly
         constrained the parameter is.
-      - "reference": fit a line (pred - true) ~ a + b*true on the reference
-        case, then subtract (a + b*true) from every case's residual before
-        binning. Removes the shared shrinkage baseline so what remains is how
-        each case's bias *differs from the reference* — the useful signal for
-        comparing noise regimes. Requires a reference_case (defaults to the
-        both-clean combo). Reference curve will be flat about zero by
-        construction; other cases show their differential bias.
+      - "reference": non-parametric per-simulation subtraction of the
+        reference case's residuals. Because every case shares idx_val, the
+        truth cancels and each case's plotted quantity becomes
+            delta_j = pred_case_j - pred_ref_j
+        binned by true value. No linear/spline fit is assumed on the reference
+        curve. Requires a reference_case (defaults to the both-clean combo).
+        Reference curve is exactly zero for every simulation, so its line is
+        flat at 0 with zero SE by construction; other curves show, per bin,
+        how the prediction shifts when the training regime changes.
 
     Returns (fig, stats) with stats = {case_sequence, obs_pair,
     reference_case, bin_edges, bin_centers, binned per case,
-    residualize_against, reference_fit (if residualized)}.
+    residualize_against}.
     """
     if results is None:
         results = all_results
@@ -4414,21 +4416,19 @@ def plot_bias_progression_overlay(param,
                 )
         per_case[c] = (y_pred, y_true, y_pred - y_true)
 
-    # ---- optional residualization against a reference case's linear trend
-    reference_fit = None
+    # ---- optional residualization: per-simulation subtraction of the reference
+    # case's residuals. No fit -- we exploit that every case shares idx_val, so
+    # true cancels and each case's plotted quantity becomes pred_case - pred_ref
+    # binned by true value. The reference case's plotted quantity is exactly 0.
     if residualize_against == "reference":
         if reference_case is None:
             raise ValueError(
                 "residualize_against='reference' requires a reference_case, but none "
                 "is set (no both-clean combo found). Pass reference_case explicitly."
             )
-        rt = per_case[reference_case][1]
-        rr = per_case[reference_case][2]
-        b_ref, a_ref = np.polyfit(rt, rr, deg=1)   # slope, intercept
-        reference_fit = {"slope": float(b_ref), "intercept": float(a_ref)}
-        # subtract the reference's fitted trend from every case's residual
+        ref_resid = per_case[reference_case][2]
         for c, (yp, yt, r) in per_case.items():
-            per_case[c] = (yp, yt, r - (a_ref + b_ref * yt))
+            per_case[c] = (yp, yt, r - ref_resid)
     elif residualize_against is not None:
         raise ValueError(
             f"residualize_against={residualize_against!r} not recognized. "
@@ -4500,18 +4500,17 @@ def plot_bias_progression_overlay(param,
     ax_main.axhline(0.0, color="k", ls="--", lw=0.8, alpha=0.6)
     ax_main.set_xlabel(f"True {p_label} (physical space)")
     if residualize_against == "reference":
-        ax_main.set_ylabel(f"(Pred − True) − reference trend   ({p_label})")
+        ax_main.set_ylabel(f"Pred_case − Pred_ref   ({p_label})")
     else:
         ax_main.set_ylabel(f"Predicted − True   ({p_label})")
     ax_main.grid(alpha=0.25)
     ax_main.legend(fontsize=8, loc="best", framealpha=0.9)
 
-    # small annotation naming what the plot's slope means
+    # small annotation naming what the plot means
     if residualize_against == "reference":
-        annot = (f"residualized: reference trend removed\n"
-                 f"β_ref={reference_fit['slope']:+.3f},  "
-                 f"α_ref={reference_fit['intercept']:+.3f}\n"
-                 f"reference curve is flat about 0 by construction")
+        annot = (f"per-simulation subtraction of {reference_case!r}\n"
+                 f"(no fit; truth cancels, so plotted = pred_case − pred_ref)\n"
+                 f"reference curve is exactly 0 by construction")
     else:
         annot = ("negative slope = MSE shrinkage baseline\n"
                  "(steepness ~ inverse constraining power)\n"
@@ -4541,7 +4540,6 @@ def plot_bias_progression_overlay(param,
         "bin_centers": centers,
         "binned": {c: {"mean": m, "se": s} for c, (m, s) in binned.items()},
         "residualize_against": residualize_against,
-        "reference_fit": reference_fit,
     }
     return fig, stats
 
