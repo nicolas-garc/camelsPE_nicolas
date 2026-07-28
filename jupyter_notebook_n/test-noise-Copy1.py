@@ -43,9 +43,12 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 #datafilename='../../DATA/data_L25LH_TNG.hdf5'
 datafilename='../../DATA/data_L50_TNG_v3.hdf5'
 with h5py.File(datafilename, 'r') as f:
-    print("Datasets available:")
+    print(f"File: {datafilename}")
+    print("Top-level attrs:", dict(f.attrs))
+    print("\nDatasets:")
     for key in f.keys():
-        print(key)
+        dset = f[key]
+        print(f"  {key:<14} shape={dset.shape}  dtype={dset.dtype}  attrs={dict(dset.attrs)}")
 
 
 with h5py.File(datafilename, 'r') as f:
@@ -336,6 +339,15 @@ val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=64, shuffle=Fals
 perm = np.random.permutation(len(idx_val))
 
 # %%
+# Bank of permutations for the robust (mean +/- std) shuffle-test R2 further down.
+# `perm` above stays as the single qualitative snapshot used by the per-case
+# scatter grids; `shuffle_perms` feeds the multi-draw R2 averages instead of
+# scoring off just one reshuffling of the validation set.
+N_SHUFFLE_PERMS = 10
+_shuffle_rng = np.random.default_rng(0)
+shuffle_perms = [_shuffle_rng.permutation(len(idx_val)) for _ in range(N_SHUFFLE_PERMS)]
+
+# %%
 importlib.reload(train)
 importlib.reload(models)
 
@@ -422,6 +434,110 @@ def make_val_loader_fn(selected_observables, x_dict, y_vector, idx, batch_size, 
 
     return loader_fn
 
+
+
+# %%
+def get_case_predictions(result, mode="aligned", perm=None, keys_to_shuffle=None, space="physical"):
+    """Validation-set predictions + truths for one trained case, cached on `result`.
+
+    This is the single place that runs a case's model forward on the validation
+    set. Every cell/plot that wants "prediction vs truth for case X under mode Y"
+    (aligned, obs1_vs_truth, obs2_vs_truth) should call this instead of
+    re-running the model -- repeated calls with the same (mode, keys, perm,
+    space) hit the cache stored at result["_pred_cache"] and return instantly.
+
+    mode: "aligned", "obs1_vs_truth", or "obs2_vs_truth" -- resolved to which
+      observable gets shuffled via resolve_shuffle (observable_1/observable_2
+      stay the single source of truth). keys_to_shuffle overrides that
+      resolution with an explicit key or list of keys.
+    perm: permutation for the shuffled modes; defaults to the global `perm`
+      set up alongside idx_val so independent call sites agree on the same
+      shuffle and hit the same cache entry. aligned-mode calls ignore perm
+      entirely (it's not used), so they always cache-hit regardless of what
+      perm happens to be floating around.
+    space: "physical" (default; undo z-score + exp the logflag columns) or
+      "log" (undo z-score only, keep logflag columns in log space).
+
+    Returns (pred_np, true_np).
+    """
+    if perm is None:
+        perm = globals().get("perm")
+        if perm is None or len(perm) != len(idx_val):
+            perm = np.random.permutation(len(idx_val))
+    perm = np.asarray(perm)
+
+    if keys_to_shuffle is not None:
+        keys = set([keys_to_shuffle] if isinstance(keys_to_shuffle, str) else keys_to_shuffle)
+        shuffle_y = (mode == "obs2_vs_truth")
+    else:
+        keys, shuffle_y = resolve_shuffle(result["selected_observables"], mode)
+
+    # aligned mode never touches perm -- drop it from the key so aligned calls
+    # always share one cache entry no matter which perm was passed in.
+    perm_component = tuple(map(int, perm)) if (keys or shuffle_y) else None
+    cache_key = (mode, tuple(sorted(keys)), perm_component, shuffle_y, space)
+
+    cache = result.setdefault("_pred_cache", {})
+    if cache_key in cache:
+        return cache[cache_key]
+
+    model = result["model"].to(device)
+    loader_fn = make_val_loader_fn(
+        selected_observables=result["selected_observables"],
+        x_dict=x_normalized_dict,
+        y_vector=y,
+        idx=idx_val,
+        batch_size=batch_size,
+        key_to_shuffle=list(keys) if keys else None,
+        perm=perm if (keys or shuffle_y) else None,
+        shuffle_y=bool(shuffle_y),
+    )
+    loader = loader_fn()
+
+    model.eval()
+    preds, trues = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            preds.append(model(xb).cpu())
+            trues.append(yb.cpu())
+
+    pred_np = torch.cat(preds).numpy()
+    true_np = torch.cat(trues).numpy()
+    pred_np = pred_np * stds + means
+    true_np = true_np * stds + means
+    if space == "physical":
+        pred_np[:, logflag] = np.exp(pred_np[:, logflag])
+        true_np[:, logflag] = np.exp(true_np[:, logflag])
+    elif space != "log":
+        raise ValueError("space must be 'physical' or 'log'.")
+
+    cache[cache_key] = (pred_np, true_np)
+    return cache[cache_key]
+
+
+# %%
+def average_r2_over_perms(mode, perms, results=None):
+    """Mean and std R2 (per case, per parameter) for shuffle `mode`, averaged
+    over several idx_val permutations instead of a single draw. Pass the SAME
+    `perms` list for "obs1_vs_truth" and "obs2_vs_truth" so draw i is
+    identical across both modes -- an apples-to-apples comparison per draw.
+
+    get_case_predictions' cache does the heavy lifting here: for a
+    single-observable case where the relevant observable isn't in play,
+    resolve_shuffle's key intersection is empty, so every draw collapses to
+    ONE cache entry (perm dropped from the cache key) -- one forward pass
+    total, and std is exactly 0, correctly reflecting that the shuffle was a
+    no-op for that case.
+    """
+    if results is None:
+        results = all_results
+    r2_draws = np.full((len(perms), len(results), output_dim), np.nan)
+    for p_idx, p in enumerate(perms):
+        for r_idx, result in enumerate(results):
+            preds, trues = get_case_predictions(result, mode=mode, perm=p)
+            r2_draws[p_idx, r_idx, :] = r2_score(trues, preds, multioutput="raw_values")
+    return np.nanmean(r2_draws, axis=0), np.nanstd(r2_draws, axis=0)
 
 
 # %%
@@ -521,33 +637,7 @@ for result in all_results:
     plt.savefig(path, dpi=200)
     plt.show()
 
-    model.eval()
-    predictions, true_values = [], []
-
-    val_loader_fn = make_val_loader_fn(
-        selected_observables=result["selected_observables"],
-        x_dict=x_normalized_dict,
-        y_vector=y,
-        idx=idx_val,
-        batch_size=batch_size, 
-    )
-    val_loader = val_loader_fn()
-
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = model(xb)
-            predictions.append(preds.cpu())
-            true_values.append(yb.cpu())
-
-    all_predictions = torch.cat(predictions).numpy()
-    all_true_values = torch.cat(true_values).numpy()
-
-    # Undo normalization if needed
-    all_predictions = all_predictions * stds + means
-    all_true_values = all_true_values * stds + means
-    all_predictions[:, logflag] = np.exp(all_predictions[:, logflag])
-    all_true_values[:, logflag] = np.exp(all_true_values[:, logflag])
+    all_predictions, all_true_values = get_case_predictions(result, mode="aligned")
 
     # Generate prediction vs true scatter plots
     n_cols = int(np.floor(np.sqrt(output_dim)))
@@ -657,44 +747,9 @@ for result_idx, result in enumerate(all_results):
     selected_observables = result["selected_observables"]
     case_name = result["case_name"]
 
-    keys_to_shuffle, shuffle_y = resolve_shuffle(selected_observables, "obs1_vs_truth")
-
     print(f"Evaluating with shifted observable — Case: {case_name}")
 
-    # Step 3: Build the validation loader using the shifted inputs
-    val_loader_fn = make_val_loader_fn(
-        selected_observables=selected_observables,
-        x_dict= x_normalized_dict,
-        y_vector= y,
-        idx=idx_val,
-        batch_size=batch_size,
-        key_to_shuffle = keys_to_shuffle,
-        perm = perm,
-        shuffle_y = shuffle_y,
-    )
-    val_loader = val_loader_fn()
-
-    # Step 4: Predict using the trained model
-    model.eval()
-    predictions, true_values = [], []
-
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = model(xb)
-            predictions.append(preds.cpu())
-            true_values.append(yb.cpu())
-
-    all_predictions = torch.cat(predictions).numpy()
-    all_true_values = torch.cat(true_values).numpy()
-
-    # Step 5: Undo normalization
-    all_predictions = all_predictions * stds + means
-    all_true_values = all_true_values * stds + means
-    all_predictions[:, logflag] = np.exp(all_predictions[:, logflag])
-    all_true_values[:, logflag] = np.exp(all_true_values[:, logflag])
-
-        
+    all_predictions, all_true_values = get_case_predictions(result, mode="obs1_vs_truth", perm=perm)
 
     n_cols = int(np.floor(np.sqrt(output_dim)))
     n_rows = int(np.ceil(output_dim / n_cols))
@@ -727,10 +782,23 @@ for result_idx, result in enumerate(all_results):
     for j in range(output_dim, n_rows * n_cols):
         fig.delaxes(axes.flat[j])
 
-    fig.suptitle(f"Prediction Results — {case_name}", fontsize=16)
+    fig.suptitle(
+        f"Prediction Results — {case_name}\n"
+        "(panel R² is a single-draw snapshot; summary tables below average over multiple draws)",
+        fontsize=16,
+    )
     fig.tight_layout()
     plt.show()
 
+
+# %%
+# Robust R2: average obs1_vs_truth over shuffle_perms instead of the single
+# global `perm` used for the scatter grids above (those stay as a qualitative
+# single-draw snapshot). Overwrites the matrix in place so everything below
+# (delta, heatmaps, dual_r2_df) needs no further changes.
+r2_matrix_shifted_observable_only, r2_std_matrix_observable_only = average_r2_over_perms(
+    "obs1_vs_truth", shuffle_perms
+)
 
 # %%
 delta_r2_observable_only = r2_matrix_shifted_observable_only - r2_matrix
@@ -823,44 +891,9 @@ for result_idx, result in enumerate(all_results):
     selected_observables = result["selected_observables"]
     case_name = result["case_name"]
 
-    keys_to_shuffle, shuffle_y = resolve_shuffle(selected_observables, "obs2_vs_truth")
-
     print(f"Evaluating with shifted observable — Case: {case_name}")
 
-    # Step 3: Build the validation loader using the shifted inputs
-    val_loader_fn = make_val_loader_fn(
-        selected_observables=selected_observables,
-        x_dict= x_normalized_dict,
-        y_vector= y,
-        idx=idx_val,
-        batch_size=batch_size,
-        key_to_shuffle = keys_to_shuffle,
-        perm = perm,
-        shuffle_y = shuffle_y,
-    )
-    val_loader = val_loader_fn()
-
-    # Step 4: Predict using the trained model
-    model.eval()
-    predictions, true_values = [], []
-
-    with torch.no_grad():
-        for xb, yb in val_loader:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = model(xb)
-            predictions.append(preds.cpu())
-            true_values.append(yb.cpu())
-
-    all_predictions = torch.cat(predictions).numpy()
-    all_true_values = torch.cat(true_values).numpy()
-
-    # Step 5: Undo normalization
-    all_predictions = all_predictions * stds + means
-    all_true_values = all_true_values * stds + means
-    all_predictions[:, logflag] = np.exp(all_predictions[:, logflag])
-    all_true_values[:, logflag] = np.exp(all_true_values[:, logflag])
-
-        
+    all_predictions, all_true_values = get_case_predictions(result, mode="obs2_vs_truth", perm=perm)
 
     n_cols = int(np.floor(np.sqrt(output_dim)))
     n_rows = int(np.ceil(output_dim / n_cols))
@@ -893,15 +926,25 @@ for result_idx, result in enumerate(all_results):
     for j in range(output_dim, n_rows * n_cols):
         fig.delaxes(axes.flat[j])
 
-    fig.suptitle(f"Prediction Results — {case_name}", fontsize=16)
+    fig.suptitle(
+        f"Prediction Results — {case_name}\n"
+        "(panel R² is a single-draw snapshot; summary tables below average over multiple draws)",
+        fontsize=16,
+    )
     fig.tight_layout()
     plt.show()
 
 
 # %%
+# Robust R2: average obs2_vs_truth over shuffle_perms (same draws used for
+# obs1_vs_truth above), overwriting the matrix in place.
+r2_matrix_shifted_both, r2_std_matrix_both = average_r2_over_perms("obs2_vs_truth", shuffle_perms)
+
+# %%
 #we want observable one from simulation i and observable 2 from simulation (i+1)
 # NOTE: this cell used to re-init r2_matrix_shifted_both to zeros here, which wiped the
-# loop's results before the heatmap below and plotted an all-zero grid.
+# loop's results before the heatmap below and plotted an all-zero grid. The cell above
+# now intentionally overwrites it with the multi-perm mean before this heatmap reads it.
 
 # Extract case names and parameter names
 case_names = [result["case_name"] for result in all_results]
@@ -972,7 +1015,8 @@ import numpy as np
 
 required = [
     'all_results', 'r2_matrix',
-    'r2_matrix_shifted_observable_only', 'r2_matrix_shifted_both'
+    'r2_matrix_shifted_observable_only', 'r2_matrix_shifted_both',
+    'r2_std_matrix_observable_only', 'r2_std_matrix_both',
 ]
 if not all(name in globals() for name in required):
     raise RuntimeError("Missing required matrices; compute both shuffled cases first.")
@@ -988,8 +1032,10 @@ for i, case in enumerate(cases):
             "case": case,
             "param": p,
             "r2_aligned": float(r2_matrix[i, j]),
-            "r2_shuf_obs1": float(r2_matrix_shifted_observable_only[i, j]),  # shuffle X, keep Y
-            "r2_shuf_obs2": float(r2_matrix_shifted_both[i, j])              # shuffle X and Y
+            "r2_shuf_obs1": float(r2_matrix_shifted_observable_only[i, j]),  # shuffle X, keep Y (mean over shuffle_perms)
+            "r2_shuf_obs2": float(r2_matrix_shifted_both[i, j]),            # shuffle X and Y (mean over shuffle_perms)
+            "r2_shuf_obs1_std": float(r2_std_matrix_observable_only[i, j]),
+            "r2_shuf_obs2_std": float(r2_std_matrix_both[i, j]),
         })
 
 dual_r2_df = pd.DataFrame(rows)
@@ -1154,7 +1200,7 @@ import matplotlib.pyplot as plt
 
 # assumes parse_case_name(...) and dual_clean_asym_order(...) are defined above
 
-def plot_param_curve_dual(df: pd.DataFrame, param: str, figsize=(8, 5)):
+def plot_param_curve_dual(df: pd.DataFrame, param: str, figsize=(8, 5), show_band=True):
     d = df[df["param"] == param].copy()
     if d.empty:
         raise ValueError(f"No rows for param {param}")
@@ -1172,11 +1218,26 @@ def plot_param_curve_dual(df: pd.DataFrame, param: str, figsize=(8, 5)):
     x = np.arange(len(d))
     fig, ax = plt.subplots(figsize=figsize)
 
+    # resolve_shuffle's dual impl: obs1_vs_truth shuffles observable_2 (truths stay
+    # with observable_1), obs2_vs_truth shuffles observable_1 (truths stay with
+    # observable_2) -- label each curve with the observable actually being shuffled.
     ax.plot(x, d["r2_aligned"].to_numpy(), marker="o", linewidth=2, label="aligned")
     ax.plot(x, d["r2_shuf_obs1"].to_numpy(), marker="s", linestyle="--", linewidth=2,
-            label="shuffled (obs1 truths)")
+            label=f"shuffled {observable_2} ({observable_1} truths)")
     ax.plot(x, d["r2_shuf_obs2"].to_numpy(), marker="^", linestyle="-.", linewidth=2,
-            label="shuffled (obs2 truths)")
+            label=f"shuffled {observable_1} ({observable_2} truths)")
+
+    # Shaded +/- 1 std band across shuffle_perms draws -- none on "aligned" (deterministic,
+    # no draw-to-draw variance since it involves no permutation).
+    if show_band and "r2_shuf_obs1_std" in d.columns:
+        r2_1 = d["r2_shuf_obs1"].to_numpy()
+        s1 = d["r2_shuf_obs1_std"].to_numpy()
+        ax.fill_between(x, r2_1 - s1, r2_1 + s1, alpha=0.15)
+    if show_band and "r2_shuf_obs2_std" in d.columns:
+        r2_2 = d["r2_shuf_obs2"].to_numpy()
+        s2 = d["r2_shuf_obs2_std"].to_numpy()
+        ax.fill_between(x, r2_2 - s2, r2_2 + s2, alpha=0.15)
+
     ax.axhline(0, linestyle=":", linewidth=1)
 
     # Optional: vertical line separating "regular" from "symmetric noise"
@@ -1203,173 +1264,6 @@ def plot_param_curve_dual(df: pd.DataFrame, param: str, figsize=(8, 5)):
 focus_params = ["θ0","θ1","θ2","θ4","θ7","θ11"]
 for p in focus_params:
     plot_param_curve_dual(dual_r2_df, p, figsize=(8,5))
-
-# %%
-import os
-import numpy as np
-import torch
-import matplotlib.pyplot as plt
-from sklearn.metrics import r2_score, mean_squared_error
-
-def plot_predictions_vs_true(parameters,
-                             noise_cases,
-                             *,
-                             results=all_results,
-                             x_dict=x_normalized_dict,
-                             y_vector=y,
-                             idx=idx_val,
-                             batch_size=batch_size,
-                             param_labels=None,
-                             save_path=None,
-                             marker_size=18,
-                             device=device):
-    """
-    Plot predicted vs. true values for selected parameters (columns of y)
-    across one or more trained noise cases (in all_results).
-
-    parameters:
-      - list of parameter identifiers (int index, "θk", or label in param_labels)
-      - or a single identifier
-      - or "all" to include all parameters
-
-    noise_cases:
-      - list of case_name strings as in your noise_cases dict (and all_results)
-      - or a single case string
-      - or "all" to include all cases in all_results
-
-    returns:
-      - matplotlib Figure
-    """
-    if not results:
-        raise ValueError("`results` is empty; train models and populate all_results first.")
-
-    def _to_list(v):
-        if v is None:
-            return None
-        if isinstance(v, (list, tuple, set)):
-            return list(v)
-        return [v]
-
-    # Resolve parameter selection
-    if isinstance(parameters, str) and parameters.lower() == "all":
-        param_list = list(range(output_dim))
-    else:
-        param_list = _to_list(parameters)
-        if not param_list:
-            raise ValueError("Provide at least one parameter (index or label).")
-
-    # Resolve case selection
-    if isinstance(noise_cases, str) and noise_cases.lower() == "all":
-        case_list = [r["case_name"] for r in results]
-    else:
-        case_list = _to_list(noise_cases)
-        if not case_list:
-            raise ValueError("Provide at least one case_name or 'all'.")
-
-    # Labels: prefer user-provided labels, then global param_names, else θi
-    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
-    label_to_idx = {label: i for i, label in enumerate(default_labels)}
-
-    def _resolve_param(p):
-        if isinstance(p, int):
-            if not 0 <= p < output_dim:
-                raise ValueError(f"Parameter index {p} out of range (0..{output_dim-1}).")
-            return p
-        if isinstance(p, str):
-            # exact label
-            if p in label_to_idx:
-                return label_to_idx[p]
-            # "θk"
-            if p.startswith("θ") and p[1:].isdigit():
-                i = int(p[1:])
-                if not 0 <= i < output_dim:
-                    raise ValueError(f"Parameter index {i} from {p} out of range.")
-                return i
-            # plain numeric string
-            if p.isdigit():
-                i = int(p)
-                if not 0 <= i < output_dim:
-                    raise ValueError(f"Parameter index {i} from string out of range.")
-                return i
-        raise ValueError(f"Cannot interpret parameter identifier: {p}")
-
-    param_indices = [_resolve_param(p) for p in param_list]
-    param_labels_resolved = [default_labels[i] for i in param_indices]
-
-    # Build case lookup and validate
-    case_to_result = {r["case_name"]: r for r in results}
-    missing = [c for c in case_list if c not in case_to_result]
-    if missing:
-        raise ValueError(f"Cases not found in all_results: {missing}")
-
-    # Helper: gather/cached predictions+truth for a case
-    def _collect_predictions(result):
-        cache_key = "_val_predictions_cache"
-        if cache_key not in result:
-            model = result["model"].to(device)
-            loader_fn = make_val_loader_fn(
-                selected_observables=result["selected_observables"],
-                x_dict=x_dict,
-                y_vector=y_vector,
-                idx=idx,
-                batch_size=batch_size,
-            )
-            loader = loader_fn()
-            preds, trues = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds.append(model(xb).cpu())
-                    trues.append(yb.cpu())
-            pred_np = torch.cat(preds).numpy()
-            true_np = torch.cat(trues).numpy()
-
-            # Undo normalization/log as your training did
-            pred_np = pred_np * stds + means
-            true_np = true_np * stds + means
-            pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-            true_np[:, logflag] = np.exp(true_np[:, logflag])
-
-            result[cache_key] = (pred_np, true_np)
-        return result[cache_key]
-
-    # Plot grid: rows = cases, cols = parameters
-    n_rows = len(case_list)
-    n_cols = len(param_indices)
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(4 * n_cols, 4 * n_rows), squeeze=False)
-
-    for r, case_name in enumerate(case_list):
-        preds, trues = _collect_predictions(case_to_result[case_name])
-        for c, (p_idx, p_label) in enumerate(zip(param_indices, param_labels_resolved)):
-            ax = axes[r, c]
-            y_true = trues[:, p_idx]
-            y_pred = preds[:, p_idx]
-            ax.scatter(y_true, y_pred, s=marker_size, alpha=0.6, edgecolor="none")
-
-            lo = float(min(y_true.min(), y_pred.min()))
-            hi = float(max(y_true.max(), y_pred.max()))
-            ax.plot([lo, hi], [lo, hi], "r--", lw=1.5)
-
-            r2 = r2_score(y_true, y_pred)
-            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-            ax.set_title(f"{case_name} | {p_label}\nR²={r2:.3f}, RMSE={rmse:.3f}")
-            if r == n_rows - 1:
-                ax.set_xlabel("True")
-            if c == 0:
-                ax.set_ylabel("Predicted")
-            ax.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    if save_path is not None:
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        fig.savefig(save_path, dpi=200)
-    return fig
-
-
-
-# %%
-fig = plot_predictions_vs_true(parameters="θ6", noise_cases="all",)
 
 # %%
 import os
@@ -1467,65 +1361,11 @@ def plot_predictions_vs_true(parameters,
     if missing:
         raise ValueError(f"Cases not found in all_results: {missing}")
 
-    # Permutation
-    if perm is None:
-        perm = np.random.permutation(len(idx))
-    perm_tuple = tuple(map(int, perm))  # for cache key
-
-    # Helper to choose which observables to shuffle for this case
-    def _resolve_keys_to_shuffle(result):
-        # delegates to the shared resolver so observable_1/observable_2 stay the
-        # single source of truth
-        if keys_to_shuffle is not None:
-            return set(_to_list(keys_to_shuffle)), (mode == "obs2_vs_truth")
-        resolved = resolve_shuffle(result["selected_observables"], mode)
-        if resolved is None:
-            raise ValueError(
-                f"{result['case_name']} has no {observable_2} to shuffle for mode {mode!r}."
-            )
-        return resolved
-
-    # Collect predictions and truths (cached per case+mode+keys+perm)
+    # Predictions come from the shared cache on each result (get_case_predictions) --
+    # defaulting perm to the global `perm` (rather than a fresh random one) means this
+    # hits the same cache entry the main shuffle loops already populated.
     def _collect_predictions(result):
-        keys, shuffle_y_flag = _resolve_keys_to_shuffle(result)
-        cache_key = ("_val_predictions_cache",
-                     mode,
-                     tuple(sorted(keys)),
-                     perm_tuple,
-                     shuffle_y_flag)
-        if cache_key not in result:
-            model = result["model"].to(device)
-            loader_fn = make_val_loader_fn(
-                selected_observables=result["selected_observables"],
-                x_dict=x_dict,
-                y_vector=y_vector,
-                idx=idx,
-                batch_size=batch_size,
-                key_to_shuffle=list(keys) if keys else None,
-                perm=perm if keys or shuffle_y_flag else None,
-                shuffle_y=bool(shuffle_y_flag)
-            )
-            loader = loader_fn()
-
-            preds, trues = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds.append(model(xb).cpu())
-                    trues.append(yb.cpu())
-
-            pred_np = torch.cat(preds).numpy()
-            true_np = torch.cat(trues).numpy()
-
-            # Undo normalization/log (as in your dataset cell)
-            pred_np = pred_np * stds + means
-            true_np = true_np * stds + means
-            pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-            true_np[:, logflag] = np.exp(true_np[:, logflag])
-
-            result[cache_key] = (pred_np, true_np)
-        return result[cache_key]
+        return get_case_predictions(result, mode=mode, perm=perm, keys_to_shuffle=keys_to_shuffle)
 
     # Plot grid: rows = cases, cols = parameters
     n_rows = len(case_list)
@@ -1653,54 +1493,9 @@ def plot_param_all_val_lines(param,
     if len(perm) != len(idx):
         raise ValueError("perm length must match len(idx_val).")
 
-    # Resolve which keys to shuffle for a given case under this mode
-    def _resolve_shuffle_keys(result):
-        # delegates to the shared resolver so observable_1/observable_2 stay the
-        # single source of truth
-        if keys_to_shuffle is not None:
-            keys = [keys_to_shuffle] if isinstance(keys_to_shuffle, str) else list(keys_to_shuffle)
-            return keys, (mode == "obs2_vs_truth")
-        resolved = resolve_shuffle(result["selected_observables"], mode)
-        if resolved is None:
-            raise ValueError(
-                f"{result['case_name']} has no {observable_2} to shuffle for mode {mode!r}."
-            )
-        keys, shuffle_y = resolved
-        return (sorted(keys) or None), shuffle_y
-
-    # Cache and collect predictions/truths for full val set for a case
+    # Predictions come from the shared cache on each result (get_case_predictions).
     def _collect_predictions(result):
-        shuffle_keys, shuffle_y_flag = _resolve_shuffle_keys(result)
-        cache_key = ("_all_val_param_lines_cache", mode, tuple(shuffle_keys or []), tuple(map(int, perm)), shuffle_y_flag)
-        if cache_key not in result:
-            model = result["model"].to(device)
-            loader_fn = make_val_loader_fn(
-                selected_observables=result["selected_observables"],
-                x_dict=x_dict,
-                y_vector=y_vector,
-                idx=idx,
-                batch_size=batch_size,
-                key_to_shuffle=shuffle_keys,
-                perm=perm if (shuffle_keys is not None or shuffle_y_flag) else None,
-                shuffle_y=shuffle_y_flag,
-            )
-            loader = loader_fn()
-            preds, trues = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds.append(model(xb).cpu())
-                    trues.append(yb.cpu())
-            pred_np = torch.cat(preds).numpy()
-            true_np = torch.cat(trues).numpy()
-            # Undo normalization/log
-            pred_np = pred_np * stds + means
-            true_np = true_np * stds + means
-            pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-            true_np[:, logflag] = np.exp(true_np[:, logflag])
-            result[cache_key] = (pred_np, true_np)
-        return result[cache_key]
+        return get_case_predictions(result, mode=mode, perm=perm, keys_to_shuffle=keys_to_shuffle)
 
     # Collect predictions for each case into [n_cases, n_val]
     preds_by_case = []
@@ -2153,54 +1948,9 @@ def plot_param_all_val(param,
     if len(perm) != len(idx):
         raise ValueError("perm length must match len(idx_val).")
 
-    # Resolve which keys to shuffle for a given case under this mode
-    def _resolve_shuffle_keys(result):
-        # delegates to the shared resolver so observable_1/observable_2 stay the
-        # single source of truth
-        if keys_to_shuffle is not None:
-            keys = [keys_to_shuffle] if isinstance(keys_to_shuffle, str) else list(keys_to_shuffle)
-            return keys, (mode == "obs2_vs_truth")
-        resolved = resolve_shuffle(result["selected_observables"], mode)
-        if resolved is None:
-            raise ValueError(
-                f"{result['case_name']} has no {observable_2} to shuffle for mode {mode!r}."
-            )
-        keys, shuffle_y = resolved
-        return (sorted(keys) or None), shuffle_y
-
-    # Cache and collect predictions/truths for full val set for a case
+    # Predictions come from the shared cache on each result (get_case_predictions).
     def _collect_predictions(result):
-        shuffle_keys, shuffle_y_flag = _resolve_shuffle_keys(result)
-        cache_key = ("_all_val_param_cache", mode, tuple(shuffle_keys or []), tuple(map(int, perm)), shuffle_y_flag)
-        if cache_key not in result:
-            model = result["model"].to(device)
-            loader_fn = make_val_loader_fn(
-                selected_observables=result["selected_observables"],
-                x_dict=x_dict,
-                y_vector=y_vector,
-                idx=idx,
-                batch_size=batch_size,
-                key_to_shuffle=shuffle_keys,
-                perm=perm if (shuffle_keys is not None or shuffle_y_flag) else None,
-                shuffle_y=shuffle_y_flag,
-            )
-            loader = loader_fn()
-            preds, trues = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds.append(model(xb).cpu())
-                    trues.append(yb.cpu())
-            pred_np = torch.cat(preds).numpy()
-            true_np = torch.cat(trues).numpy()
-            # Undo normalization/log as in your preprocessing
-            pred_np = pred_np * stds + means
-            true_np = true_np * stds + means
-            pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-            true_np[:, logflag] = np.exp(true_np[:, logflag])
-            result[cache_key] = (pred_np, true_np)
-        return result[cache_key]
+        return get_case_predictions(result, mode=mode, perm=perm, keys_to_shuffle=keys_to_shuffle)
 
     # Build scatter data
     xs, ys = [], []
@@ -2385,68 +2135,18 @@ def plot_param_pair_normalized_values(
     if len(perm) != len(idx):
         raise ValueError("perm length must match len(idx_val).")
 
-    # --- Resolve which keys are shuffled for a case under this mode ---
+    # Predictions come from the shared cache on each result (get_case_predictions).
+    # This function reconstructs both truth alignments itself (t_obs1/t_obs2 below)
+    # from which keys moved, so it never needs shuffle_y -- resolve_shuffle already
+    # always returns shuffle_y=False, so the shared cache's behavior matches.
     def _resolve_shuffle_keys(result):
-        # This function reconstructs both truth alignments itself (t_obs1/t_obs2 below)
-        # from which keys moved, so it never needs shuffle_y — it only needs to know
-        # which observable was shuffled, which is always observable_2.
         if keys_to_shuffle is not None:
             return [keys_to_shuffle] if isinstance(keys_to_shuffle, str) else list(keys_to_shuffle)
-        resolved = resolve_shuffle(result["selected_observables"], mode)
-        if resolved is None:
-            raise ValueError(
-                f"{result['case_name']} has no {observable_2} to shuffle for mode {mode!r}."
-            )
-        keys, _ = resolved
+        keys, _ = resolve_shuffle(result["selected_observables"], mode)
         return sorted(keys) or None
 
-    # --- Collect predictions and truth (idx-ordered) for a case ---
     def _collect_predictions(result):
-        shuffle_keys = _resolve_shuffle_keys(result)
-        cache_key = ("_pair_norm_values_cache",
-                     mode,
-                     tuple(shuffle_keys or []),
-                     tuple(map(int, perm)),
-                     space)
-        if cache_key not in result:
-            model = result["model"].to(device)
-            loader_fn = make_val_loader_fn(
-                selected_observables=result["selected_observables"],
-                x_dict=x_dict,
-                y_vector=y_vector,
-                idx=idx,
-                batch_size=batch_size,
-                key_to_shuffle=shuffle_keys,
-                perm=perm if shuffle_keys is not None else None,
-                shuffle_y=False,
-            )
-            loader = loader_fn()
-            preds, trues = [], []
-            model.eval()
-            with torch.no_grad():
-                for xb, yb in loader:
-                    xb, yb = xb.to(device), yb.to(device)
-                    preds.append(model(xb).cpu())
-                    trues.append(yb.cpu())
-            pred_np = torch.cat(preds).numpy()
-            true_np = torch.cat(trues).numpy()
-
-            # Undo standardization
-            pred_np = pred_np * stds + means
-            true_np = true_np * stds + means
-
-            # Choose space
-            if space == "physical":
-                pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-                true_np[:, logflag] = np.exp(true_np[:, logflag])
-            elif space == "log":
-                # keep log space (no exp)
-                pass
-            else:
-                raise ValueError("space must be 'physical' or 'log'.")
-
-            result[cache_key] = (pred_np, true_np)
-        return result[cache_key]
+        return get_case_predictions(result, mode=mode, perm=perm, keys_to_shuffle=keys_to_shuffle, space=space)
 
     # --- Collect predictions per case: [n_cases, n_val] ---
     preds_by_case = []
@@ -3828,14 +3528,17 @@ def _collect_constraint_2d_case_arrays(
         )
 
     def _resolve_shuffle_keys():
-        # both comparison modes shuffle obs2; this function reads the truth alignment
-        # off the shuffled/unshuffled split itself, so shuffle_y stays False
+        # obs1_vs_truth keeps obs1 aligned to truth by shuffling obs2 (and vice
+        # versa) -- matches the canonical resolve_shuffle convention. shuffle_y
+        # stays False; truth alignment is read off which key got shuffled.
         if mode == "aligned":
             return None
         if keys_to_shuffle is not None:
             return [keys_to_shuffle] if isinstance(keys_to_shuffle, str) else list(keys_to_shuffle)
-        if mode in ("obs1_vs_truth", "obs2_vs_truth"):
+        if mode == "obs1_vs_truth":
             return [obs2_key]
+        if mode == "obs2_vs_truth":
+            return [obs1_key]
         raise ValueError("mode must be 'aligned', 'obs1_vs_truth', or 'obs2_vs_truth'.")
 
     shuffle_keys = _resolve_shuffle_keys()
@@ -3852,6 +3555,8 @@ def _collect_constraint_2d_case_arrays(
     cache_key = (
         "_constraint_2d_cache_v1",
         case_name,
+        obs1_key,
+        obs2_key,
         mode,
         tuple(shuffle_keys or []),
         tuple(map(int, perm)) if perm is not None else None,
@@ -3897,8 +3602,8 @@ def _collect_constraint_2d_case_arrays(
             raise ValueError("target_space must be 'processed', 'log', or 'physical'.")
 
         idx_arr = np.asarray(idx)
-        obs1_arr = np.asarray(x_dict[obs1_key][idx_arr], copy=True)
-        obs2_arr = np.asarray(x_dict[obs2_key][idx_arr], copy=True)
+        obs1_arr = np.array(x_dict[obs1_key][idx_arr], copy=True)
+        obs2_arr = np.array(x_dict[obs2_key][idx_arr], copy=True)
 
         if shuffle_keys is not None and perm is not None:
             if obs1_key in set(shuffle_keys):
@@ -4413,5 +4118,437 @@ fig, stats = plot_unordered_pair_prediction_map(
 plt.show()
 print(stats)
 
+
+# %%
+def plot_predictions_vs_true_by_noise(parameters,
+                                       *,
+                                       mode="aligned",       # "aligned", "obs1_vs_truth", "obs2_vs_truth"
+                                       cases="auto",         # "auto" -> ordered core cases; or explicit list
+                                       results=all_results,
+                                       x_dict=x_normalized_dict,
+                                       y_vector=y,
+                                       idx=idx_val,
+                                       batch_size=batch_size,
+                                       param_labels=None,
+                                       perm=None,
+                                       marker_size=18,
+                                       save_dir=None,
+                                       device=device):
+    """
+    One figure per parameter, one row of prediction-vs-truth scatters per
+    noise case, laid out left-to-right in dual_clean_asym_order's core order:
+    clean_obs1 -> (obs1 clean, obs2 ramping up) -> both clean ->
+    (obs2 clean, obs1 ramping up) -> clean_obs2. Scanning a row left to right
+    shows how a single parameter's predictions degrade/recover as each
+    observable's noise level changes.
+    """
+    if not results:
+        raise ValueError("`results` is empty; train models and populate all_results first.")
+
+    def _to_list(v):
+        if isinstance(v, str) or not hasattr(v, "__iter__"):
+            return [v]
+        return list(v)
+
+    if isinstance(parameters, str) and parameters.lower() == "all":
+        param_list = list(range(output_dim))
+    else:
+        param_list = _to_list(parameters)
+        if not param_list:
+            raise ValueError("Provide at least one parameter (index or label).")
+
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+
+    def _resolve_param(p):
+        if isinstance(p, int):
+            if not 0 <= p < output_dim:
+                raise ValueError(f"Parameter index {p} out of range (0..{output_dim-1}).")
+            return p
+        if isinstance(p, str):
+            if p in label_to_idx:
+                return label_to_idx[p]
+            if p.startswith("θ") and p[1:].isdigit():
+                i = int(p[1:])
+                if not 0 <= i < output_dim:
+                    raise ValueError(f"Parameter index {i} from {p} out of range.")
+                return i
+            if p.isdigit():
+                i = int(p)
+                if not 0 <= i < output_dim:
+                    raise ValueError(f"Parameter index {i} from string out of range.")
+                return i
+        raise ValueError(f"Cannot interpret parameter identifier: {p}")
+
+    param_indices = [_resolve_param(p) for p in param_list]
+    param_labels_resolved = [default_labels[i] for i in param_indices]
+
+    # Order cases via the same clean-obs1 -> ... -> clean-obs2 path used elsewhere
+    case_to_result = {r["case_name"]: r for r in results}
+    all_case_names = [r["case_name"] for r in results]
+    ordered_all, split_idx = dual_clean_asym_order(all_case_names)
+    ordered_core = ordered_all[:split_idx]
+
+    if cases == "auto":
+        case_list = [c for c in ordered_core if c in case_to_result]
+    else:
+        wanted = set(_to_list(cases))
+        case_list = [c for c in ordered_core if c in wanted]
+    if not case_list:
+        raise ValueError("No cases to plot after ordering/selection.")
+
+    if mode in ("obs1_vs_truth", "obs2_vs_truth"):
+        case_list = [c for c in case_list if len(case_to_result[c]["selected_observables"]) >= 2]
+        if not case_list:
+            raise ValueError("No multi-observable cases available for this mode after filtering.")
+
+    if perm is None:
+        perm = globals().get("perm")
+        if perm is None or len(perm) != len(idx):
+            perm = np.random.permutation(len(idx))
+    perm = np.asarray(perm)
+
+    def _collect_predictions(result):
+        return get_case_predictions(result, mode=mode, perm=perm)
+
+    mode_title = {"aligned": "Aligned",
+                  "obs1_vs_truth": f"{observable_2} shuffled, {observable_1} truths",
+                  "obs2_vs_truth": f"{observable_2} shuffled, {observable_2} truths"}[mode]
+
+    figs = {}
+    for p_idx, p_label in zip(param_indices, param_labels_resolved):
+        n_cols = len(case_list)
+        fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4.2), squeeze=False)
+        axes = axes[0]
+
+        for c, case_name in enumerate(case_list):
+            preds, trues = _collect_predictions(case_to_result[case_name])
+            ax = axes[c]
+            y_true = trues[:, p_idx]
+            y_pred = preds[:, p_idx]
+            ax.scatter(y_true, y_pred, s=marker_size, alpha=0.6, edgecolor="none")
+
+            lo = float(min(y_true.min(), y_pred.min()))
+            hi = float(max(y_true.max(), y_pred.max()))
+            ax.plot([lo, hi], [lo, hi], "r--", lw=1.5)
+
+            r2 = r2_score(y_true, y_pred)
+            rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+            ax.set_title(f"{case_name}\nR²={r2:.3f}, RMSE={rmse:.3f}")
+            ax.set_xlabel("True")
+            if c == 0:
+                ax.set_ylabel("Predicted")
+            ax.grid(True, alpha=0.3)
+
+        fig.suptitle(f"{mode_title} — {p_label}: prediction vs truth across noise cases", y=1.03)
+        fig.tight_layout()
+        if save_dir is not None:
+            os.makedirs(save_dir, exist_ok=True)
+            fig.savefig(os.path.join(save_dir, f"{p_label}_by_noise.png"), dpi=200, bbox_inches="tight")
+        figs[p_label] = fig
+
+    return figs
+
+
+# %%
+def plot_bias_progression_overlay(param,
+                                   *,
+                                   case_sequence=None,
+                                   obs_pair=None,
+                                   results=None,
+                                   param_labels=None,
+                                   n_bins=15,
+                                   min_per_bin=5,
+                                   reference_case=None,
+                                   show_scatter_for=None,
+                                   scatter_alpha=0.15,
+                                   scatter_size=6,
+                                   figsize=(9, 7),
+                                   perm=None,
+                                   residualize_against=None,
+                                   save_path=None):
+    """
+    Overlay per-case (pred - true) vs true bias curves for one parameter, with
+    a shared x-axis and a marginal histogram of true values on top. Cases are
+    ordered along the dual_clean_asym_order sequence for a chosen pair of
+    observables (clean_left -> asym_left -> both_clean -> asym_right ->
+    clean_right); color encodes position along that ramp.
+
+    Generalizes to any two observables in `results`. Case sequence resolution:
+      1. If `case_sequence` is given, use it as-is.
+      2. Else if `obs_pair=(obsA, obsB)` is given, filter results to combo
+         cases involving exactly that pair (plus their single-obs references)
+         and run dual_clean_asym_order on that filtered list.
+      3. Else auto-detect: if exactly one distinct observable pair exists
+         across combo cases, use it. Otherwise raise, listing available pairs.
+
+    `reference_case` defaults to the "both clean" combo (noise1==0 and
+    noise2==0) in the resolved sequence, auto-detected via parse_case_name
+    rather than hardcoded.
+
+    Only aligned-mode predictions are pulled (via get_case_predictions), and
+    we assert row-for-row truth agreement across cases so the "true value on
+    the x-axis" is unambiguous.
+
+    `residualize_against`:
+      - None (default): plot raw (pred - true) per case. Every parameter shows
+        a universal negative slope because MSE minimization shrinks predictions
+        toward the prior mean; the slope steepness is diagnostic of how weakly
+        constrained the parameter is.
+      - "reference": fit a line (pred - true) ~ a + b*true on the reference
+        case, then subtract (a + b*true) from every case's residual before
+        binning. Removes the shared shrinkage baseline so what remains is how
+        each case's bias *differs from the reference* — the useful signal for
+        comparing noise regimes. Requires a reference_case (defaults to the
+        both-clean combo). Reference curve will be flat about zero by
+        construction; other cases show their differential bias.
+
+    Returns (fig, stats) with stats = {case_sequence, obs_pair,
+    reference_case, bin_edges, bin_centers, binned per case,
+    residualize_against, reference_fit (if residualized)}.
+    """
+    if results is None:
+        results = all_results
+
+    # ---- parameter index (same resolver shape as plot_predictions_vs_true_by_noise)
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range (0..{output_dim-1}).")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    # ---- resolve case sequence and obs_pair
+    case_to_result = {r["case_name"]: r for r in results}
+
+    if case_sequence is None:
+        combo_pairs = set()
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo":
+                combo_pairs.add(frozenset((info["obs1"], info["obs2"])))
+
+        if obs_pair is None:
+            if not combo_pairs:
+                raise ValueError("No combo cases in results; cannot auto-detect an observable pair.")
+            if len(combo_pairs) > 1:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"Multiple observable pairs found in results: {pretty}. "
+                    f"Pass obs_pair=(obsA, obsB) to disambiguate."
+                )
+            obs_pair = tuple(sorted(next(iter(combo_pairs))))
+        else:
+            wanted = frozenset(obs_pair)
+            if wanted not in combo_pairs:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"obs_pair={tuple(obs_pair)} not found in combo cases. Available pairs: {pretty}."
+                )
+            obs_pair = tuple(obs_pair)
+
+        obs_set = set(obs_pair)
+        filtered = []
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and {info["obs1"], info["obs2"]} == obs_set:
+                filtered.append(c)
+            elif info["kind"] == "single" and info["obs"] in obs_set:
+                filtered.append(c)
+
+        ordered_all, split_idx = dual_clean_asym_order(filtered)
+        case_sequence = ordered_all[:split_idx]
+    else:
+        case_sequence = list(case_sequence)
+        if obs_pair is None:
+            for c in case_sequence:
+                info = parse_case_name(c)
+                if info["kind"] == "combo":
+                    obs_pair = (info["obs1"], info["obs2"])
+                    break
+
+    if not case_sequence:
+        raise ValueError("Resolved case_sequence is empty -- nothing to plot.")
+    missing = [c for c in case_sequence if c not in case_to_result]
+    if missing:
+        raise ValueError(f"Cases not found in results: {missing}")
+
+    # ---- reference case (both-clean combo)
+    if reference_case is None:
+        for c in case_sequence:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and info.get("noise1") == 0.0 and info.get("noise2") == 0.0:
+                reference_case = c
+                break
+    if reference_case is not None and reference_case not in case_sequence:
+        raise ValueError(f"reference_case {reference_case!r} not in resolved case_sequence.")
+
+    # ---- collect predictions, verify aligned-mode truth agreement across cases
+    per_case = {}
+    ref_true = None
+    for c in case_sequence:
+        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm)
+        y_pred = preds[:, p_idx]
+        y_true = trues[:, p_idx]
+        if ref_true is None:
+            ref_true = y_true
+        else:
+            if not np.allclose(y_true, ref_true, rtol=1e-8, atol=1e-8):
+                raise ValueError(
+                    f"Truths for case {c!r} do not match the first case's truths row-for-row. "
+                    f"get_case_predictions(mode='aligned') should share idx_val across cases."
+                )
+        per_case[c] = (y_pred, y_true, y_pred - y_true)
+
+    # ---- optional residualization against a reference case's linear trend
+    reference_fit = None
+    if residualize_against == "reference":
+        if reference_case is None:
+            raise ValueError(
+                "residualize_against='reference' requires a reference_case, but none "
+                "is set (no both-clean combo found). Pass reference_case explicitly."
+            )
+        rt = per_case[reference_case][1]
+        rr = per_case[reference_case][2]
+        b_ref, a_ref = np.polyfit(rt, rr, deg=1)   # slope, intercept
+        reference_fit = {"slope": float(b_ref), "intercept": float(a_ref)}
+        # subtract the reference's fitted trend from every case's residual
+        for c, (yp, yt, r) in per_case.items():
+            per_case[c] = (yp, yt, r - (a_ref + b_ref * yt))
+    elif residualize_against is not None:
+        raise ValueError(
+            f"residualize_against={residualize_against!r} not recognized. "
+            f"Use None (default) or 'reference'."
+        )
+
+    # ---- shared bin edges from the reference truths
+    lo, hi = float(ref_true.min()), float(ref_true.max())
+    edges = np.linspace(lo, hi, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+
+    def _bin_resid(y_true, resid):
+        b_idx = np.clip(np.digitize(y_true, edges) - 1, 0, n_bins - 1)
+        means = np.full(n_bins, np.nan)
+        se    = np.full(n_bins, np.nan)
+        for b in range(n_bins):
+            m = b_idx == b
+            n = int(m.sum())
+            if n >= min_per_bin:
+                r = resid[m]
+                means[b] = r.mean()
+                se[b]    = r.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+        return means, se
+
+    binned = {c: _bin_resid(v[1], v[2]) for c, v in per_case.items()}
+
+    # ---- figure: stacked axes, shared x
+    fig = plt.figure(figsize=figsize)
+    gs = fig.add_gridspec(2, 1, height_ratios=[1, 4], hspace=0.06)
+    ax_hist = fig.add_subplot(gs[0])
+    ax_main = fig.add_subplot(gs[1], sharex=ax_hist)
+
+    ax_hist.hist(ref_true, bins=edges, color="#B4B2A9", edgecolor="none")
+    ax_hist.set_yticks([])
+    for side in ("top", "right", "left"):
+        ax_hist.spines[side].set_visible(False)
+    ax_hist.tick_params(axis="x", labelbottom=False)
+
+    cmap = plt.get_cmap("coolwarm")
+    n = len(case_sequence)
+    positions = np.linspace(0, 1, n) if n > 1 else np.array([0.5])
+    colors = {c: cmap(p) for c, p in zip(case_sequence, positions)}
+
+    if show_scatter_for:
+        for c in show_scatter_for:
+            if c not in per_case:
+                continue
+            y_true = per_case[c][1]; resid = per_case[c][2]
+            ax_main.scatter(y_true, resid, s=scatter_size, alpha=scatter_alpha,
+                            color=colors[c], edgecolor="none", zorder=1)
+
+    for c in case_sequence:
+        if c == reference_case:
+            continue
+        means, se = binned[c]
+        m = ~np.isnan(means)
+        ax_main.plot(centers[m], means[m], "-", color=colors[c], lw=1.6, label=c, zorder=2)
+        ax_main.fill_between(centers[m], (means - se)[m], (means + se)[m],
+                             color=colors[c], alpha=0.15, linewidth=0, zorder=2)
+
+    if reference_case is not None:
+        means, se = binned[reference_case]
+        m = ~np.isnan(means)
+        ax_main.plot(centers[m], means[m], "-", color="black", lw=2.4,
+                     label=f"{reference_case} (reference)", zorder=3)
+        ax_main.fill_between(centers[m], (means - se)[m], (means + se)[m],
+                             color="black", alpha=0.18, linewidth=0, zorder=3)
+
+    ax_main.axhline(0.0, color="k", ls="--", lw=0.8, alpha=0.6)
+    ax_main.set_xlabel(f"True {p_label} (physical space)")
+    if residualize_against == "reference":
+        ax_main.set_ylabel(f"(Pred − True) − reference trend   ({p_label})")
+    else:
+        ax_main.set_ylabel(f"Predicted − True   ({p_label})")
+    ax_main.grid(alpha=0.25)
+    ax_main.legend(fontsize=8, loc="best", framealpha=0.9)
+
+    # small annotation naming what the plot's slope means
+    if residualize_against == "reference":
+        annot = (f"residualized: reference trend removed\n"
+                 f"β_ref={reference_fit['slope']:+.3f},  "
+                 f"α_ref={reference_fit['intercept']:+.3f}\n"
+                 f"reference curve is flat about 0 by construction")
+    else:
+        annot = ("negative slope = MSE shrinkage baseline\n"
+                 "(steepness ~ inverse constraining power)\n"
+                 "pass residualize_against='reference' to subtract it")
+    ax_main.text(0.02, 0.98, annot, transform=ax_main.transAxes,
+                 va="top", ha="left", fontsize=8, color="#3C3489",
+                 bbox=dict(facecolor="white", edgecolor="#B4B2A9",
+                          alpha=0.9, boxstyle="round,pad=0.4"))
+
+    pair_str = f"{obs_pair[0]} ↔ {obs_pair[1]}" if obs_pair else "unknown pair"
+    ax_hist.set_title(
+        f"Bias progression for {p_label}\n"
+        f"observables: {pair_str}   |   {len(case_sequence)} cases in dual-clean-asym order",
+        fontsize=11
+    )
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case_sequence": case_sequence,
+        "obs_pair": obs_pair,
+        "reference_case": reference_case,
+        "n_bins": n_bins,
+        "bin_edges": edges,
+        "bin_centers": centers,
+        "binned": {c: {"mean": m, "se": s} for c, (m, s) in binned.items()},
+        "residualize_against": residualize_against,
+        "reference_fit": reference_fit,
+    }
+    return fig, stats
+
+
+# %%
+figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
+for p_label, fig in figs_by_param.items():
+    plt.show()
 
 # %%
