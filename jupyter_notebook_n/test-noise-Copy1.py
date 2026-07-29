@@ -5343,12 +5343,65 @@ def plot_per_sim_accuracy_heatmap(param,
 
 
 # %%
+def _compute_all_chimera_preds(result, mode, x_dict, idx_val_, p_idx, batch_size, device_):
+    """All chimera predictions for one case + one parameter.
+
+    Returns a (n_val, n_val) matrix where entry [j, k] is the model's
+    prediction (in physical space, matching get_case_predictions) when the
+    input uses:
+      - row j's KEPT observable(s), and
+      - row k's SHUFFLED observable(s)
+
+    j == k rows are still computed; the caller filters them if unwanted.
+    Column layout in the model input matches the loader: features are
+    concatenated in sorted(selected_observables.keys()) order. Uses the
+    module-level stds/means/logflag to convert to physical space so this
+    matches get_case_predictions bit-for-bit at j == k (aligned rows).
+    """
+    selected = result["selected_observables"]
+    sel_keys_sorted = sorted(selected.keys())
+    shuffle_keys, _ = resolve_shuffle(selected, mode)
+    shuffle_set = set(shuffle_keys)
+
+    idx_arr = np.asarray(idx_val_)
+    n = len(idx_arr)
+
+    # For each observable in sorted order, build (n*n, feat_dim) with the
+    # convention that flat row (j*n + k) holds:
+    #   arr[j] if the observable is KEPT
+    #   arr[k] if the observable is SHUFFLED
+    # np.repeat(arr, n, axis=0) → [arr[0]*n, arr[1]*n, ...]      → row j·n+k = arr[j]
+    # np.tile(arr,   (n, 1))    → [arr[0..n-1], arr[0..n-1], ...] → row j·n+k = arr[k]
+    cols = []
+    for key in sel_keys_sorted:
+        arr = x_dict[key][idx_arr]
+        expanded = np.tile(arr, (n, 1)) if key in shuffle_set else np.repeat(arr, n, axis=0)
+        cols.append(torch.from_numpy(expanded).float())
+    x_all = torch.cat(cols, dim=1)
+
+    model = result["model"].to(device_)
+    model.eval()
+    outs = []
+    with torch.no_grad():
+        for i in range(0, x_all.shape[0], batch_size):
+            outs.append(model(x_all[i:i + batch_size].to(device_)).cpu())
+    preds_flat = torch.cat(outs, dim=0).numpy()
+
+    pred_p = preds_flat[:, p_idx] * stds[p_idx] + means[p_idx]
+    if logflag[p_idx]:
+        pred_p = np.exp(pred_p)
+    return pred_p.reshape(n, n)
+
+
 def plot_pair_normalized_shuffle_scatter(param,
                                             *,
                                             case=None,
                                             mode="obs1_vs_truth",
                                             obs_pair=None,
                                             normalize_endpoints="obs1_to_obs2",
+                                            n_pairs=None,
+                                            pair_seed=0,
+                                            all_pairs_batch_size=2048,
                                             results=None,
                                             param_labels=None,
                                             perm=None,
@@ -5359,8 +5412,8 @@ def plot_pair_normalized_shuffle_scatter(param,
                                             show_diagonal=True,
                                             show_zero_lines=True,
                                             show_unit_lines=True,
-                                            marker_alpha=0.65,
-                                            marker_size=22,
+                                            marker_alpha=None,
+                                            marker_size=None,
                                             figsize=(7.5, 7.5),
                                             save_path=None):
     """
@@ -5396,6 +5449,25 @@ def plot_pair_normalized_shuffle_scatter(param,
 
     Mode: `mode` selects which observable is shuffled (obs1_vs_truth →
     shuffle observable_2; obs2_vs_truth → shuffle observable_1).
+
+    n_pairs: how many chimeras per anchor sim.
+      - None (default): one fixed perm; each anchor j gets exactly one
+        partner perm[j]. n_val dots total (backwards compatible).
+      - int K: draw K random perms (seeded by pair_seed). Each anchor
+        gets K different partners; K × n_val dots total. Uses
+        get_case_predictions (K forward passes; cache misses since each
+        perm is unique).
+      - "all": every ordered pair (j, k) with j != k. One batched forward
+        pass through the model builds the full n × n chimera matrix.
+        n × (n − 1) dots total (~10k for n_val ≈ 102), the exhaustive
+        picture. Uses `all_pairs_batch_size` to chunk the forward pass.
+      IMPORTANT: for a given anchor j, pred_aligned[j] and truth[j] are
+      fixed, so all pairs sharing anchor j have the SAME x value. The
+      enriched scatter organizes into ~n_val vertical clusters, one per
+      anchor -- expected structure, not a rendering artifact.
+
+    marker_alpha / marker_size default to None → auto-scaled from the
+    pair count so dense enriched scatters stay legible.
 
     Degeneracy filter is SCALE-INVARIANT across parameters. A pair is dropped
     if |θ_2 − θ_1| < max(min_pair_distance_frac × range(true), degenerate_eps),
@@ -5495,45 +5567,81 @@ def plot_pair_normalized_shuffle_scatter(param,
     if len(perm) != len(idx_val):
         raise ValueError("perm length must match len(idx_val).")
 
-    # --- aligned + shuffled predictions from the shared cache ---
-    preds_a, true_a = get_case_predictions(result, mode="aligned",  perm=perm)
-    preds_s, true_s = get_case_predictions(result, mode=mode,       perm=perm)
-    if not np.allclose(true_a, true_s, rtol=1e-8, atol=1e-8):
+    # --- aligned predictions from the shared cache (used regardless of n_pairs) ---
+    preds_a, true_a = get_case_predictions(result, mode="aligned", perm=perm)
+    pa = preds_a[:, p_idx]                # θ̂_aligned per anchor row (fixed)
+    truth_base = true_a[:, p_idx]         # truth per row
+    n_val = len(pa)
+
+    # --- build pair arrays (anchors, partners, pred_shuf_per_pair) per n_pairs mode ---
+    if n_pairs is None:
+        # Single-perm mode (original behaviour). One pair per anchor.
+        preds_s, true_s = get_case_predictions(result, mode=mode, perm=perm)
+        if not np.allclose(true_a, true_s, rtol=1e-8, atol=1e-8):
+            raise ValueError(
+                "aligned vs shuffled truth vectors differ -- get_case_predictions returned "
+                "inconsistent truths across modes."
+            )
+        anchors = np.arange(n_val)
+        partners = perm
+        pred_shuf_arr = preds_s[:, p_idx]
+        n_pairs_desc = f"1 perm × {n_val} rows = {n_val}"
+    elif isinstance(n_pairs, int) and not isinstance(n_pairs, bool):
+        if n_pairs < 1:
+            raise ValueError(f"n_pairs must be >= 1 (got {n_pairs}).")
+        K = n_pairs
+        rng_ = np.random.default_rng(pair_seed)
+        perms = [rng_.permutation(n_val) for _ in range(K)]
+        anchors = np.tile(np.arange(n_val), K)
+        partners = np.concatenate(perms)
+        shuf_chunks = []
+        for pk in perms:
+            preds_k, _ = get_case_predictions(result, mode=mode, perm=pk)
+            shuf_chunks.append(preds_k[:, p_idx])
+        pred_shuf_arr = np.concatenate(shuf_chunks)
+        n_pairs_desc = f"{K} perms × {n_val} rows = {K * n_val}"
+    elif isinstance(n_pairs, str) and n_pairs == "all":
+        chimera = _compute_all_chimera_preds(
+            result, mode, x_normalized_dict, idx_val, p_idx,
+            batch_size=all_pairs_batch_size, device_=device,
+        )  # (n_val, n_val); [j, k] = pred with anchor j + partner k
+        # Enumerate all ordered pairs with j != k
+        jj, kk = np.meshgrid(np.arange(n_val), np.arange(n_val), indexing="ij")
+        off_diag = jj != kk
+        anchors = jj[off_diag]
+        partners = kk[off_diag]
+        pred_shuf_arr = chimera[anchors, partners]
+        n_pairs_desc = f"all ordered j≠k pairs = {n_val}×{n_val - 1} = {len(anchors)}"
+    else:
         raise ValueError(
-            "aligned vs shuffled truth vectors differ -- get_case_predictions returned "
-            "inconsistent truths across modes."
+            f"n_pairs must be None, a positive int, or 'all'; got {n_pairs!r}."
         )
 
-    pa = preds_a[:, p_idx]     # θ̂_aligned per row
-    ps = preds_s[:, p_idx]     # θ̂_shuffled per row
-    truth_base = true_a[:, p_idx]         # truth from row j itself (base)
-    truth_perm = true_a[perm, p_idx]      # truth from row perm[j]
+    # --- per-pair truths (anchor + partner), then endpoint convention ---
+    pa_arr    = pa[anchors]
+    truth_j   = truth_base[anchors]       # truth of the KEPT-obs sim (anchor)
+    truth_k   = truth_base[partners]      # truth of the SHUFFLED-obs sim (partner)
 
-    # For "obs1_vs_truth" the shuffle permutes obs2 --> sim supplying obs2 is perm[j]
-    # For "obs2_vs_truth" the shuffle permutes obs1 --> sim supplying obs1 is perm[j]
-    # (same convention as plot_param_pair_normalized_values)
+    # anchor supplies obs1 under obs1_vs_truth; anchor supplies obs2 under obs2_vs_truth
     if mode == "obs1_vs_truth":
-        t_obs1, t_obs2 = truth_base, truth_perm
+        t_obs1_arr, t_obs2_arr = truth_j, truth_k
     else:  # obs2_vs_truth
-        t_obs1, t_obs2 = truth_perm, truth_base
+        t_obs1_arr, t_obs2_arr = truth_k, truth_j
 
     if normalize_endpoints == "obs1_to_obs2":
-        t0, t1 = t_obs1, t_obs2
+        t0_arr, t1_arr = t_obs1_arr, t_obs2_arr
         endpoint_desc = f"sim_1 = source of {obs1_key} (→0);  sim_2 = source of {obs2_key} (→1)"
     elif normalize_endpoints == "obs2_to_obs1":
-        t0, t1 = t_obs2, t_obs1
+        t0_arr, t1_arr = t_obs2_arr, t_obs1_arr
         endpoint_desc = f"sim_1 = source of {obs2_key} (→0);  sim_2 = source of {obs1_key} (→1)"
     else:
         raise ValueError("normalize_endpoints must be 'obs1_to_obs2' or 'obs2_to_obs1'.")
 
-    denom_abs = np.abs(t1 - t0)
-    n_val = len(pa)
-    # Scale-invariant degeneracy threshold: for each parameter, the "small pair"
-    # cutoff is a FRACTION of the parameter's own true-value range, not a fixed
-    # absolute epsilon. A hardcoded epsilon like 1e-8 is meaningless for a
-    # parameter that lives in [1e-5, 1e-4] (all its pairs are "small" in absolute
-    # terms) and irrelevant for a parameter in [10, 100] (no pair is that small).
-    # degenerate_eps stays as a tiny absolute floor for numerical stability.
+    denom_abs = np.abs(t1_arr - t0_arr)
+    # Scale-invariant degeneracy threshold: FRACTION of the parameter's own true-
+    # value range, not a fixed absolute epsilon. A hardcoded epsilon like 1e-8 is
+    # meaningless for a parameter that lives in [1e-5, 1e-4] and irrelevant for
+    # a parameter in [10, 100]. degenerate_eps stays as a tiny absolute floor.
     param_range = float(true_a[:, p_idx].max() - true_a[:, p_idx].min())
     frac_threshold = min_pair_distance_frac * param_range if drop_degenerate_pairs else 0.0
     threshold = max(frac_threshold, degenerate_eps)
@@ -5541,18 +5649,29 @@ def plot_pair_normalized_shuffle_scatter(param,
         keep = denom_abs > threshold
     else:
         keep = np.ones_like(denom_abs, dtype=bool)
+    n_total = len(anchors)
     n_kept = int(keep.sum()); n_dropped = int((~keep).sum())
     if n_kept == 0:
         raise ValueError(
-            f"All {n_val} pairs are degenerate (|θ_2 − θ_1| ≤ {threshold:g} = "
+            f"All {n_total} pairs are degenerate (|θ_2 − θ_1| ≤ {threshold:g} = "
             f"max({min_pair_distance_frac}×range={frac_threshold:g}, "
             f"degenerate_eps={degenerate_eps:g})). "
-            f"Try a different perm or lower min_pair_distance_frac."
+            f"Try different pair_seed / lower min_pair_distance_frac."
         )
 
     # user's Q5 convention: numerator is (θ̂ − θ_1), i.e. prediction − sim_1 truth
-    x = (pa - t0)[keep] / denom_abs[keep]
-    y = (ps - t0)[keep] / denom_abs[keep]
+    x = (pa_arr - t0_arr)[keep] / denom_abs[keep]
+    y = (pred_shuf_arr - t0_arr)[keep] / denom_abs[keep]
+
+    # --- auto-scale marker alpha and size based on pair count ---
+    if marker_alpha is None:
+        if n_kept <= 200:      marker_alpha = 0.65
+        elif n_kept <= 2000:   marker_alpha = 0.25
+        else:                  marker_alpha = 0.10
+    if marker_size is None:
+        if n_kept <= 200:      marker_size = 22
+        elif n_kept <= 2000:   marker_size = 8
+        else:                  marker_size = 4
 
     # --- plot ---
     fig, ax = plt.subplots(figsize=figsize)
@@ -5584,21 +5703,22 @@ def plot_pair_normalized_shuffle_scatter(param,
                  "obs2_vs_truth": f"shuffle {obs1_key}  (kept: {obs2_key})"}[mode]
     ax.set_title(
         f"Pair-normalized aligned vs shuffled residuals — {p_label}\n"
-        f"case: {case}   |   mode: {mode} ({mode_desc})\n"
+        f"case: {case}   |   mode: {mode} ({mode_desc})   |   pairs: {n_pairs_desc}\n"
         f"{endpoint_desc}",
         fontsize=10
     )
     ax.legend(fontsize=8, loc="best", framealpha=0.9)
 
     annot_lines = [
-        "each dot = one val sim paired with perm[j]",
+        "each dot = one (anchor sim, partner sim) chimera",
+        "same anchor → same x (vertical clusters expected)",
         "on y=x → shuffling didn't move the prediction",
         "y > x → shuffled pred is higher than aligned pred",
         "y = ±1 → shuffled pred is one |θ_2−θ_1| off sim_1's truth",
     ]
     if drop_degenerate_pairs and n_dropped:
         annot_lines.append(
-            f"dropped {n_dropped} degenerate pairs "
+            f"dropped {n_dropped}/{n_total} degenerate pairs "
             f"(|θ_2−θ_1| ≤ {threshold:.3g}, i.e. {min_pair_distance_frac*100:g}% of {p_label}'s range)"
         )
     ax.text(0.02, 0.98, "\n".join(annot_lines), transform=ax.transAxes,
@@ -5615,16 +5735,20 @@ def plot_pair_normalized_shuffle_scatter(param,
         "mode": mode,
         "obs_pair": obs_pair,
         "normalize_endpoints": normalize_endpoints,
+        "n_pairs": n_pairs,
         "n_val": n_val,
+        "n_total_pairs": n_total,
         "n_kept": n_kept,
         "n_dropped": n_dropped,
         "x": x,
         "y": y,
+        "anchors": anchors[keep],
+        "partners": partners[keep],
         "denom_abs": denom_abs[keep],
-        "truth_sim1": t0[keep],
-        "truth_sim2": t1[keep],
-        "pred_aligned":  pa[keep],
-        "pred_shuffled": ps[keep],
+        "truth_sim1": t0_arr[keep],
+        "truth_sim2": t1_arr[keep],
+        "pred_aligned":  pa_arr[keep],
+        "pred_shuffled": pred_shuf_arr[keep],
     }
     return fig, stats
 
