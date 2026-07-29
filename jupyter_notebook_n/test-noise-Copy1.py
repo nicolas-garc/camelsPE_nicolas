@@ -4804,6 +4804,285 @@ def plot_directional_pull_by_true(param,
 
 
 # %%
+def plot_prediction_attractor_map(param,
+                                    *,
+                                    case_sequence=None,
+                                    obs_pair=None,
+                                    results=None,
+                                    param_labels=None,
+                                    n_bins=15,
+                                    min_per_bin=5,
+                                    reference_case=None,
+                                    weight_by=None,           # None | "aligned_r2"
+                                    show_identity=True,
+                                    show_prior_mean=True,
+                                    show_se_band=True,
+                                    figsize=(8.5, 8),
+                                    perm=None,
+                                    save_path=None):
+    """
+    One-panel condensation of the per-case prediction-vs-truth scatters:
+    each case becomes a binned line of mean(pred) vs true, so N noise cases
+    show as N curves in the same panel and you see how the pred/truth
+    relationship evolves across the case sequence in one view.
+
+    Reference lines drawn on the plot:
+      - y = x (identity): predictions equal truth, no shrinkage. Model has
+        perfect info about θ.
+      - y = mean(true): predictions collapsed to the prior mean. Model has
+        no info.  Every real case's line sits between these two extremes;
+        vertical position at each true-θ tells you how much predictions are
+        being pulled toward the mean at that part of the parameter range.
+
+    Cases are colored along dual_clean_asym_order with coolwarm; the
+    reference case (auto-detected as the both-clean combo, or passed
+    explicitly) is drawn in bold black on top so it stands out as the
+    "best-info" baseline every other case can be compared against.
+
+    weight_by:
+      - None (default): all case lines drawn at uniform alpha.
+      - "aligned_r2": per-case line alpha scaled by its aligned R² --
+        cases with poor R² fade out so you're not lulled by a confident-
+        looking line from a case whose predictions are actually noise.
+
+    Case sequence resolution mirrors plot_bias_progression_overlay:
+    obs_pair auto-detect from single-pair results, or pass explicitly.
+    Only aligned-mode predictions are pulled; truth agreement across
+    cases is verified row-for-row.
+
+    Returns (fig, stats) with per-case binned means/SEs and per-case
+    aligned R² for downstream use.
+    """
+    if results is None:
+        results = all_results
+
+    # ---- parameter index (mirrors sibling functions)
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range (0..{output_dim-1}).")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    # ---- resolve case sequence + obs_pair (mirrors sibling functions)
+    case_to_result = {r["case_name"]: r for r in results}
+    if case_sequence is None:
+        combo_pairs = set()
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo":
+                combo_pairs.add(frozenset((info["obs1"], info["obs2"])))
+        if obs_pair is None:
+            if not combo_pairs:
+                raise ValueError("No combo cases in results; cannot auto-detect an observable pair.")
+            if len(combo_pairs) > 1:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"Multiple observable pairs found in results: {pretty}. "
+                    f"Pass obs_pair=(obsA, obsB) to disambiguate."
+                )
+            obs_pair = tuple(sorted(next(iter(combo_pairs))))
+        else:
+            wanted = frozenset(obs_pair)
+            if wanted not in combo_pairs:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"obs_pair={tuple(obs_pair)} not found in combo cases. Available pairs: {pretty}."
+                )
+            obs_pair = tuple(obs_pair)
+        obs_set = set(obs_pair)
+        filtered = []
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and {info["obs1"], info["obs2"]} == obs_set:
+                filtered.append(c)
+            elif info["kind"] == "single" and info["obs"] in obs_set:
+                filtered.append(c)
+        ordered_all, split_idx = dual_clean_asym_order(filtered)
+        case_sequence = ordered_all[:split_idx]
+    else:
+        case_sequence = list(case_sequence)
+        if obs_pair is None:
+            for c in case_sequence:
+                info = parse_case_name(c)
+                if info["kind"] == "combo":
+                    obs_pair = (info["obs1"], info["obs2"])
+                    break
+
+    if not case_sequence:
+        raise ValueError("Resolved case_sequence is empty -- nothing to plot.")
+    missing = [c for c in case_sequence if c not in case_to_result]
+    if missing:
+        raise ValueError(f"Cases not found in results: {missing}")
+
+    # ---- reference case
+    if reference_case is None:
+        for c in case_sequence:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and info.get("noise1") == 0.0 and info.get("noise2") == 0.0:
+                reference_case = c
+                break
+    if reference_case is not None and reference_case not in case_sequence:
+        raise ValueError(f"reference_case {reference_case!r} not in resolved case_sequence.")
+
+    # ---- collect predictions, verify truth alignment
+    per_case = {}
+    true_ref = None
+    for c in case_sequence:
+        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm)
+        yp = preds[:, p_idx]; yt = trues[:, p_idx]
+        if true_ref is None:
+            true_ref = yt
+        else:
+            if not np.allclose(yt, true_ref, rtol=1e-8, atol=1e-8):
+                raise ValueError(
+                    f"Truths for case {c!r} do not match the first case's truths row-for-row. "
+                    f"get_case_predictions(mode='aligned') should share idx_val across cases."
+                )
+        per_case[c] = (yp, yt)
+
+    # ---- per-case aligned R² (for optional weighting)
+    aligned_r2 = {}
+    tt = true_ref
+    ss_tot = float(((tt - tt.mean())**2).sum())
+    for c, (yp, _) in per_case.items():
+        ss_res = float(((yp - tt)**2).sum())
+        aligned_r2[c] = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    # ---- shared bin edges from the true θ range
+    lo, hi = float(true_ref.min()), float(true_ref.max())
+    edges = np.linspace(lo, hi, n_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_idx = np.clip(np.digitize(true_ref, edges) - 1, 0, n_bins - 1)
+
+    def _bin_mean_se(y):
+        means = np.full(n_bins, np.nan)
+        se    = np.full(n_bins, np.nan)
+        for b in range(n_bins):
+            m = bin_idx == b
+            n = int(m.sum())
+            if n >= min_per_bin:
+                v = y[m]
+                means[b] = v.mean()
+                se[b]    = v.std(ddof=1) / np.sqrt(n) if n > 1 else 0.0
+        return means, se
+
+    binned = {c: _bin_mean_se(per_case[c][0]) for c in case_sequence}
+
+    # ---- alpha weights per case
+    n_cases = len(case_sequence)
+    if weight_by == "aligned_r2":
+        r2_vals = np.array([aligned_r2[c] for c in case_sequence])
+        r2_min, r2_max = float(r2_vals.min()), float(r2_vals.max())
+        if r2_max > r2_min:
+            alphas = 0.35 + 0.55 * (r2_vals - r2_min) / (r2_max - r2_min)
+        else:
+            alphas = np.full(n_cases, 0.85)
+    elif weight_by is None:
+        alphas = np.full(n_cases, 0.85)
+    else:
+        raise ValueError(f"weight_by={weight_by!r} not recognized. Use None or 'aligned_r2'.")
+
+    # ---- figure
+    fig, ax = plt.subplots(figsize=figsize)
+
+    prior_mean = float(true_ref.mean())
+
+    # reference lines (drawn under everything)
+    if show_identity:
+        ax.plot([lo, hi], [lo, hi], "--", color="#444441", lw=1.2, alpha=0.7,
+                label="y = x (identity: no shrinkage)", zorder=1)
+    if show_prior_mean:
+        ax.axhline(prior_mean, color="#5F5E5A", ls=":", lw=1.1, alpha=0.7,
+                   label=f"y = mean(true θ) = {prior_mean:.3g} (full shrinkage)", zorder=1)
+
+    # per-case binned lines, ordered along the sequence
+    cmap = plt.get_cmap("coolwarm")
+    positions = np.linspace(0, 1, n_cases) if n_cases > 1 else np.array([0.5])
+    colors = {c: cmap(p) for c, p in zip(case_sequence, positions)}
+
+    for c, alpha_c in zip(case_sequence, alphas):
+        if c == reference_case:
+            continue
+        means, se = binned[c]
+        m = ~np.isnan(means)
+        r2 = aligned_r2[c]
+        lab = f"{c}  (R²={r2:+.2f})"
+        if show_se_band:
+            ax.fill_between(centers[m], (means - se)[m], (means + se)[m],
+                            color=colors[c], alpha=0.15 * (alpha_c / 0.85),
+                            linewidth=0, zorder=2)
+        ax.plot(centers[m], means[m], "-", color=colors[c], lw=1.7,
+                alpha=alpha_c, label=lab, zorder=3)
+
+    # reference case last, in bold black
+    if reference_case is not None:
+        means, se = binned[reference_case]
+        m = ~np.isnan(means)
+        r2 = aligned_r2[reference_case]
+        lab = f"{reference_case}  (R²={r2:+.2f})   ← reference"
+        if show_se_band:
+            ax.fill_between(centers[m], (means - se)[m], (means + se)[m],
+                            color="black", alpha=0.15, linewidth=0, zorder=4)
+        ax.plot(centers[m], means[m], "-", color="black", lw=2.6,
+                label=lab, zorder=5)
+
+    ax.set_xlim(lo, hi)
+    ax.set_xlabel(f"True {p_label} (physical space)")
+    ax.set_ylabel(f"Mean predicted {p_label} per bin")
+    ax.grid(alpha=0.25)
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+
+    pair_str = f"{obs_pair[0]} ↔ {obs_pair[1]}" if obs_pair else "unknown pair"
+    ax.set_title(
+        f"Attractor map for {p_label} — {n_cases} noise cases collapsed into one view\n"
+        f"observables: {pair_str}   |   line color = case position in dual-clean-asym order",
+        fontsize=11
+    )
+
+    annot_lines = ["closer to y=x → less shrinkage (more info)",
+                   "closer to horizontal mean line → more shrinkage (less info)",
+                   "per-case slope tells you how well each case recovers θ"]
+    if weight_by == "aligned_r2":
+        annot_lines.append("line alpha scaled by aligned R² (faded = noisy case)")
+    ax.text(0.02, 0.98, "\n".join(annot_lines), transform=ax.transAxes,
+            va="top", ha="left", fontsize=8, color="#3C3489",
+            bbox=dict(facecolor="white", edgecolor="#B4B2A9",
+                     alpha=0.9, boxstyle="round,pad=0.4"))
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case_sequence": case_sequence,
+        "obs_pair": obs_pair,
+        "reference_case": reference_case,
+        "prior_mean": prior_mean,
+        "bin_edges": edges,
+        "bin_centers": centers,
+        "binned_mean_pred": {c: binned[c][0] for c in case_sequence},
+        "binned_se_pred":   {c: binned[c][1] for c in case_sequence},
+        "aligned_r2":       aligned_r2,
+    }
+    return fig, stats
+
+
+# %%
 figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
 for p_label, fig in figs_by_param.items():
     plt.show()
