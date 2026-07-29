@@ -5083,6 +5083,266 @@ def plot_prediction_attractor_map(param,
 
 
 # %%
+def plot_per_sim_accuracy_heatmap(param,
+                                     *,
+                                     case_sequence=None,
+                                     obs_pair=None,
+                                     results=None,
+                                     param_labels=None,
+                                     quantity="abs_error",     # "abs_error" | "signed_residual" | "prediction"
+                                     cmap=None,
+                                     vmin=None, vmax=None,
+                                     n_quantile_ticks=6,
+                                     show_summary_strip=True,
+                                     figsize=(11, 9),
+                                     perm=None,
+                                     save_path=None):
+    """
+    Per-simulation × per-case heatmap: rows = individual val simulations
+    sorted by true θ ascending, columns = cases in dual_clean_asym_order.
+
+    Answers "which sims (in which part of the parameter range) improve as
+    the noise regime shifts across cases" -- horizontal bands in the
+    heatmap = groups of sims that share behavior, vertical patterns = case
+    quality shifts, diagonal patterns = middle-of-range sims improving in
+    middle-of-sequence cases (etc). Per-sim structure is preserved (no
+    binning), sorted so the parameter-range axis is the y-axis.
+
+    quantity:
+      - "abs_error"        cell = |pred_case - true|.  Bright = high error
+                           (bad), dark = low error (good).
+      - "signed_residual"  cell = pred_case - true.  Diverging colormap
+                           centered at 0.  Red = over-predicted here, blue =
+                           under-predicted.
+      - "prediction"       cell = pred_case value itself.
+
+    A thin sidebar on the left shows the true θ gradient for each row so
+    you can read which part of the parameter range a given row lives in.
+    An optional summary strip along the bottom shows the median-across-
+    sims value per case (a compact "how did this case do overall" view).
+
+    Case-resolution and truth-agreement plumbing mirrors the sibling
+    plotters. Returns (fig, stats).
+    """
+    if results is None:
+        results = all_results
+
+    # ---- parameter index
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range (0..{output_dim-1}).")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    # ---- case sequence + obs_pair (same resolver as sibling functions)
+    case_to_result = {r["case_name"]: r for r in results}
+    if case_sequence is None:
+        combo_pairs = set()
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo":
+                combo_pairs.add(frozenset((info["obs1"], info["obs2"])))
+        if obs_pair is None:
+            if not combo_pairs:
+                raise ValueError("No combo cases in results; cannot auto-detect an observable pair.")
+            if len(combo_pairs) > 1:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"Multiple observable pairs found in results: {pretty}. "
+                    f"Pass obs_pair=(obsA, obsB) to disambiguate."
+                )
+            obs_pair = tuple(sorted(next(iter(combo_pairs))))
+        else:
+            wanted = frozenset(obs_pair)
+            if wanted not in combo_pairs:
+                pretty = sorted(sorted(list(p)) for p in combo_pairs)
+                raise ValueError(
+                    f"obs_pair={tuple(obs_pair)} not found in combo cases. Available pairs: {pretty}."
+                )
+            obs_pair = tuple(obs_pair)
+        obs_set = set(obs_pair)
+        filtered = []
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if info["kind"] == "combo" and {info["obs1"], info["obs2"]} == obs_set:
+                filtered.append(c)
+            elif info["kind"] == "single" and info["obs"] in obs_set:
+                filtered.append(c)
+        ordered_all, split_idx = dual_clean_asym_order(filtered)
+        case_sequence = ordered_all[:split_idx]
+    else:
+        case_sequence = list(case_sequence)
+        if obs_pair is None:
+            for c in case_sequence:
+                info = parse_case_name(c)
+                if info["kind"] == "combo":
+                    obs_pair = (info["obs1"], info["obs2"])
+                    break
+
+    if not case_sequence:
+        raise ValueError("Resolved case_sequence is empty -- nothing to plot.")
+    missing = [c for c in case_sequence if c not in case_to_result]
+    if missing:
+        raise ValueError(f"Cases not found in results: {missing}")
+
+    # ---- collect predictions, verify truth alignment
+    n_cases = len(case_sequence)
+    preds_by_case = None
+    true_ref = None
+    for k, c in enumerate(case_sequence):
+        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm)
+        yp = preds[:, p_idx]; yt = trues[:, p_idx]
+        if true_ref is None:
+            true_ref = yt
+            preds_by_case = np.zeros((len(yp), n_cases))
+        else:
+            if not np.allclose(yt, true_ref, rtol=1e-8, atol=1e-8):
+                raise ValueError(
+                    f"Truths for case {c!r} do not match the first case's truths row-for-row. "
+                    f"get_case_predictions(mode='aligned') should share idx_val across cases."
+                )
+        preds_by_case[:, k] = yp
+
+    n_sims = preds_by_case.shape[0]
+
+    # ---- compute the cell quantity
+    if quantity == "abs_error":
+        Z = np.abs(preds_by_case - true_ref[:, None])
+        default_cmap = "magma"
+        cbar_label = f"|pred − true|   ({p_label})"
+        center_diverging = False
+    elif quantity == "signed_residual":
+        Z = preds_by_case - true_ref[:, None]
+        default_cmap = "RdBu_r"
+        cbar_label = f"pred − true   ({p_label})"
+        center_diverging = True
+    elif quantity == "prediction":
+        Z = preds_by_case
+        default_cmap = "viridis"
+        cbar_label = f"prediction   ({p_label})"
+        center_diverging = False
+    else:
+        raise ValueError(f"quantity={quantity!r} not recognized. "
+                         f"Use 'abs_error', 'signed_residual', or 'prediction'.")
+
+    # ---- sort rows by true θ ascending
+    order = np.argsort(true_ref)
+    Z_sorted = Z[order]
+    true_sorted = true_ref[order]
+
+    # ---- vmin/vmax defaults
+    if center_diverging:
+        m = float(np.nanmax(np.abs(Z_sorted)))
+        vmin_use = -m if vmin is None else vmin
+        vmax_use = +m if vmax is None else vmax
+    else:
+        vmin_use = float(np.nanmin(Z_sorted)) if vmin is None else vmin
+        vmax_use = float(np.nanmax(Z_sorted)) if vmax is None else vmax
+    cmap_use = plt.get_cmap(cmap or default_cmap)
+
+    # ---- figure layout: [true-θ sidebar] [main heatmap]  +  optional bottom summary strip
+    if show_summary_strip:
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(2, 3, width_ratios=[0.35, 20, 0.6],
+                              height_ratios=[10, 0.6], hspace=0.05, wspace=0.06)
+        ax_side = fig.add_subplot(gs[0, 0])
+        ax_main = fig.add_subplot(gs[0, 1], sharey=ax_side)
+        ax_cbar = fig.add_subplot(gs[0, 2])
+        ax_summary = fig.add_subplot(gs[1, 1], sharex=ax_main)
+    else:
+        fig = plt.figure(figsize=figsize)
+        gs = fig.add_gridspec(1, 3, width_ratios=[0.35, 20, 0.6], wspace=0.06)
+        ax_side = fig.add_subplot(gs[0, 0])
+        ax_main = fig.add_subplot(gs[0, 1], sharey=ax_side)
+        ax_cbar = fig.add_subplot(gs[0, 2])
+        ax_summary = None
+
+    # ---- true-θ sidebar (thin column of true values as a color gradient)
+    ax_side.imshow(true_sorted[:, None], aspect="auto", cmap="cividis",
+                   origin="lower", extent=[0, 1, 0, n_sims])
+    ax_side.set_xticks([])
+    # y-ticks at n_quantile_ticks evenly-spaced quantile positions of the sorted true θ
+    tick_positions = np.linspace(0, n_sims - 1, n_quantile_ticks).astype(int)
+    ax_side.set_yticks(tick_positions + 0.5)
+    ax_side.set_yticklabels([f"{true_sorted[p]:.3g}" for p in tick_positions], fontsize=8)
+    ax_side.set_ylabel(f"True {p_label} (sorted ascending)")
+    for side in ("top", "right"):
+        ax_side.spines[side].set_visible(False)
+
+    # ---- main heatmap
+    im = ax_main.imshow(Z_sorted, aspect="auto", cmap=cmap_use, origin="lower",
+                        vmin=vmin_use, vmax=vmax_use,
+                        extent=[0, n_cases, 0, n_sims], interpolation="nearest")
+    ax_main.set_xticks(np.arange(n_cases) + 0.5)
+    ax_main.set_xticklabels(case_sequence, rotation=45, ha="right", fontsize=9)
+    ax_main.set_yticks([])
+    for side in ("top", "right"):
+        ax_main.spines[side].set_visible(False)
+
+    cbar = fig.colorbar(im, cax=ax_cbar)
+    cbar.set_label(cbar_label, fontsize=9)
+
+    # ---- optional summary strip (median across sims per case)
+    if ax_summary is not None:
+        summary = np.median(Z_sorted, axis=0, keepdims=True)   # (1, n_cases)
+        im2 = ax_summary.imshow(summary, aspect="auto", cmap=cmap_use, origin="lower",
+                                vmin=vmin_use, vmax=vmax_use,
+                                extent=[0, n_cases, 0, 1], interpolation="nearest")
+        # overlay text values
+        for k in range(n_cases):
+            v = summary[0, k]
+            ax_summary.text(k + 0.5, 0.5, f"{v:.3g}",
+                            ha="center", va="center", fontsize=7.5, color="white",
+                            path_effects=None)
+        ax_summary.set_xticks(np.arange(n_cases) + 0.5)
+        ax_summary.set_xticklabels(case_sequence, rotation=45, ha="right", fontsize=8)
+        ax_summary.set_yticks([0.5])
+        ax_summary.set_yticklabels(["median"], fontsize=8)
+        for side in ("top", "right"):
+            ax_summary.spines[side].set_visible(False)
+        # hide the tick labels on the main axis if we have a summary strip
+        ax_main.tick_params(axis="x", labelbottom=False)
+
+    pair_str = f"{obs_pair[0]} ↔ {obs_pair[1]}" if obs_pair else "unknown pair"
+    ax_side.set_title(
+        f"Per-sim {quantity} across cases — {p_label}\n"
+        f"observables: {pair_str}   |   rows sorted by true {p_label}",
+        fontsize=11, loc="left", pad=10
+    )
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case_sequence": case_sequence,
+        "obs_pair": obs_pair,
+        "quantity": quantity,
+        "sort_index": order,
+        "true_sorted": true_sorted,
+        "Z_sorted": Z_sorted,
+        "case_median": np.median(Z_sorted, axis=0),
+        "case_mean":   np.nanmean(Z_sorted, axis=0),
+    }
+    return fig, stats
+
+
+# %%
 figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
 for p_label, fig in figs_by_param.items():
     plt.show()
