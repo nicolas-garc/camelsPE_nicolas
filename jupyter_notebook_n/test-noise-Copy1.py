@@ -5610,4 +5610,42 @@ figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
 for p_label, fig in figs_by_param.items():
     plt.show()
 
+# %% [markdown]
+# ## Loops over param_np for the new plot functions
+# Each cell runs one plot function across the parameters in `param_np`.
+# get_case_predictions caches per (result, mode, perm, space) so the first
+# param call warms the cache and subsequent params are fast.
+
+# %%
+# aligned residual (pred - true) binned by true value, per case;
+# residualize_against="reference" available -- see docstring
+for p in list(param_np):
+    fig, stats = plot_bias_progression_overlay(param=p)
+    plt.show()
+
+# %%
+# signed directional pull per sim, binned by true value, vs accuracy floor
+for p in list(param_np):
+    fig, stats = plot_directional_pull_by_true(param=p)
+    plt.show()
+
+# %%
+# all cases as binned lines in one pred-vs-true panel with y=x and y=mean references
+for p in list(param_np):
+    fig, stats = plot_prediction_attractor_map(param=p)
+    plt.show()
+
+# %%
+# per-sim × per-case grid, rows sorted by true θ (default: |pred - true|)
+for p in list(param_np):
+    fig, stats = plot_per_sim_accuracy_heatmap(param=p)
+    plt.show()
+
+# %%
+# aligned vs shuffled pair-normalized residuals; one dot per sim,
+# defaults to the both-clean combo and mode="obs1_vs_truth"
+for p in list(param_np):
+    fig, stats = plot_pair_normalized_shuffle_scatter(param=p, case=None)
+    plt.show()
+
 # %%
