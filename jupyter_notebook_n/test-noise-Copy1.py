@@ -5343,6 +5343,252 @@ def plot_per_sim_accuracy_heatmap(param,
 
 
 # %%
+def plot_pair_normalized_shuffle_scatter(param,
+                                            *,
+                                            case=None,
+                                            mode="obs1_vs_truth",
+                                            obs_pair=None,
+                                            normalize_endpoints="obs1_to_obs2",
+                                            results=None,
+                                            param_labels=None,
+                                            perm=None,
+                                            drop_degenerate_pairs=True,
+                                            degenerate_eps=1e-8,
+                                            clip_range=(-3.0, 3.0),
+                                            show_diagonal=True,
+                                            show_zero_lines=True,
+                                            show_unit_lines=True,
+                                            marker_alpha=0.65,
+                                            marker_size=22,
+                                            figsize=(7.5, 7.5),
+                                            save_path=None):
+    """
+    Aligned vs shuffled prediction residuals for one parameter, one noise
+    case, one dot per validation simulation, normalized by the pair
+    truth-distance |θ_2 − θ_1|.
+
+    For each val row j (paired with perm[j]):
+        θ_1 = truth of sim_1 (the sim supplying the unshuffled channel)
+        θ_2 = truth of sim_2 (the sim supplying the shuffled channel)
+        θ̂_aligned  = model prediction using sim_1's full data (both obs from j)
+        θ̂_shuffled = model prediction using the chimera
+                     (row j's kept channel + row perm[j]'s shuffled channel)
+    Plot:
+        x = (θ̂_aligned  − θ_1) / |θ_2 − θ_1|
+        y = (θ̂_shuffled − θ_1) / |θ_2 − θ_1|
+
+    Reads:
+      - On y = x line: shuffling did not move the prediction.
+      - y > x: shuffled prediction is higher than aligned prediction (in
+        units of pair-distance).
+      - y = ±1: shuffled prediction lands one absolute pair-distance
+        above (or below) sim_1's truth. When θ_2 > θ_1, y=+1 means the
+        prediction has been pulled fully onto sim_2's truth.
+
+    Reuses the truth-alignment machinery from plot_param_pair_normalized_values:
+    which sim is 0 vs 1 is set by normalize_endpoints (obs1_to_obs2 by
+    default, so sim_1 = source of observable_1 = the sim whose obs1 is
+    kept intact under mode="obs1_vs_truth").
+
+    Case: `case` defaults to the both-clean combo case for the observable
+    pair (auto-detected via parse_case_name).  Only single-case at a time.
+
+    Mode: `mode` selects which observable is shuffled (obs1_vs_truth →
+    shuffle observable_2; obs2_vs_truth → shuffle observable_1).
+
+    Returns (fig, stats).
+    """
+    if results is None:
+        results = all_results
+
+    # --- resolve parameter (mirrors sibling functions) ---
+    default_labels = param_labels or globals().get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range.")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    if mode not in ("obs1_vs_truth", "obs2_vs_truth"):
+        raise ValueError(f"mode must be 'obs1_vs_truth' or 'obs2_vs_truth', not {mode!r}.")
+
+    # --- resolve obs_pair (default: analysis-wide observable_1/observable_2) ---
+    if obs_pair is None:
+        obs_pair = (observable_1, observable_2)
+    obs1_key, obs2_key = obs_pair
+    obs_set = set(obs_pair)
+
+    # --- resolve case (default: both-clean combo for this pair) ---
+    case_to_result = {r["case_name"]: r for r in results}
+    if case is None:
+        for c in case_to_result:
+            info = parse_case_name(c)
+            if (info["kind"] == "combo"
+                    and info.get("noise1") == 0.0
+                    and info.get("noise2") == 0.0
+                    and {info["obs1"], info["obs2"]} == obs_set):
+                case = c
+                break
+        if case is None:
+            raise ValueError(
+                f"No both-clean combo case found containing {sorted(obs_pair)}. "
+                f"Pass `case` explicitly."
+            )
+    if case not in case_to_result:
+        raise ValueError(f"Case {case!r} not in results.")
+    result = case_to_result[case]
+    selected = set(result["selected_observables"])
+    if not obs_set.issubset(selected):
+        missing = obs_set - selected
+        raise ValueError(
+            f"Case {case!r} is missing {sorted(missing)}; scatter needs both "
+            f"{obs1_key} and {obs2_key} present so the shuffle produces a real chimera."
+        )
+
+    # --- perm (same fallback pattern as sibling) ---
+    if perm is None:
+        perm = globals().get("perm")
+        if perm is None or len(perm) != len(idx_val):
+            perm = np.random.permutation(len(idx_val))
+    perm = np.asarray(perm)
+    if len(perm) != len(idx_val):
+        raise ValueError("perm length must match len(idx_val).")
+
+    # --- aligned + shuffled predictions from the shared cache ---
+    preds_a, true_a = get_case_predictions(result, mode="aligned",  perm=perm)
+    preds_s, true_s = get_case_predictions(result, mode=mode,       perm=perm)
+    if not np.allclose(true_a, true_s, rtol=1e-8, atol=1e-8):
+        raise ValueError(
+            "aligned vs shuffled truth vectors differ -- get_case_predictions returned "
+            "inconsistent truths across modes."
+        )
+
+    pa = preds_a[:, p_idx]     # θ̂_aligned per row
+    ps = preds_s[:, p_idx]     # θ̂_shuffled per row
+    truth_base = true_a[:, p_idx]         # truth from row j itself (base)
+    truth_perm = true_a[perm, p_idx]      # truth from row perm[j]
+
+    # For "obs1_vs_truth" the shuffle permutes obs2 --> sim supplying obs2 is perm[j]
+    # For "obs2_vs_truth" the shuffle permutes obs1 --> sim supplying obs1 is perm[j]
+    # (same convention as plot_param_pair_normalized_values)
+    if mode == "obs1_vs_truth":
+        t_obs1, t_obs2 = truth_base, truth_perm
+    else:  # obs2_vs_truth
+        t_obs1, t_obs2 = truth_perm, truth_base
+
+    if normalize_endpoints == "obs1_to_obs2":
+        t0, t1 = t_obs1, t_obs2
+        endpoint_desc = f"sim_1 = source of {obs1_key} (→0);  sim_2 = source of {obs2_key} (→1)"
+    elif normalize_endpoints == "obs2_to_obs1":
+        t0, t1 = t_obs2, t_obs1
+        endpoint_desc = f"sim_1 = source of {obs2_key} (→0);  sim_2 = source of {obs1_key} (→1)"
+    else:
+        raise ValueError("normalize_endpoints must be 'obs1_to_obs2' or 'obs2_to_obs1'.")
+
+    denom_abs = np.abs(t1 - t0)
+    n_val = len(pa)
+    if drop_degenerate_pairs:
+        keep = denom_abs > degenerate_eps
+    else:
+        keep = np.ones_like(denom_abs, dtype=bool)
+    n_kept = int(keep.sum()); n_dropped = int((~keep).sum())
+    if n_kept == 0:
+        raise ValueError(
+            "All pairs are degenerate (|θ_2 − θ_1| ≤ eps). Try a different perm "
+            f"or relax degenerate_eps={degenerate_eps:g}."
+        )
+
+    # user's Q5 convention: numerator is (θ̂ − θ_1), i.e. prediction − sim_1 truth
+    x = (pa - t0)[keep] / denom_abs[keep]
+    y = (ps - t0)[keep] / denom_abs[keep]
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize)
+
+    if show_zero_lines:
+        ax.axhline(0, color="#B4B2A9", lw=0.9, alpha=0.7, zorder=1)
+        ax.axvline(0, color="#B4B2A9", lw=0.9, alpha=0.7, zorder=1)
+    if show_unit_lines:
+        for u in (-1.0, 1.0):
+            ax.axhline(u, color="#993C1D", ls=":", lw=0.9, alpha=0.55, zorder=1)
+            ax.axvline(u, color="#993C1D", ls=":", lw=0.9, alpha=0.55, zorder=1)
+    if show_diagonal:
+        lo, hi = clip_range
+        ax.plot([lo, hi], [lo, hi], "--", color="#5F5E5A", lw=1.2, alpha=0.6,
+                zorder=1, label="y = x (shuffling had no effect)")
+
+    ax.scatter(x, y, s=marker_size, alpha=marker_alpha, color="#3C3489",
+               edgecolor="none", zorder=3, label=f"{n_kept} sims")
+
+    ax.set_xlim(*clip_range)
+    ax.set_ylim(*clip_range)
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.25)
+
+    ax.set_xlabel(r"$(\hat{\theta}_1^{\rm aligned} - \theta_1)\ /\ |\theta_2 - \theta_1|$")
+    ax.set_ylabel(r"$(\hat{\theta}_1^{\rm shuffled} - \theta_1)\ /\ |\theta_2 - \theta_1|$")
+
+    mode_desc = {"obs1_vs_truth": f"shuffle {obs2_key}  (kept: {obs1_key})",
+                 "obs2_vs_truth": f"shuffle {obs1_key}  (kept: {obs2_key})"}[mode]
+    ax.set_title(
+        f"Pair-normalized aligned vs shuffled residuals — {p_label}\n"
+        f"case: {case}   |   mode: {mode} ({mode_desc})\n"
+        f"{endpoint_desc}",
+        fontsize=10
+    )
+    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+
+    annot_lines = [
+        "each dot = one val sim paired with perm[j]",
+        "on y=x → shuffling didn't move the prediction",
+        "y > x → shuffled pred is higher than aligned pred",
+        "y = ±1 → shuffled pred is one |θ_2−θ_1| off sim_1's truth",
+    ]
+    if drop_degenerate_pairs and n_dropped:
+        annot_lines.append(f"dropped {n_dropped} degenerate pairs (|θ_2−θ_1| ≤ {degenerate_eps:g})")
+    ax.text(0.02, 0.98, "\n".join(annot_lines), transform=ax.transAxes,
+            va="top", ha="left", fontsize=8, color="#3C3489",
+            bbox=dict(facecolor="white", edgecolor="#B4B2A9",
+                     alpha=0.9, boxstyle="round,pad=0.4"))
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case": case,
+        "mode": mode,
+        "obs_pair": obs_pair,
+        "normalize_endpoints": normalize_endpoints,
+        "n_val": n_val,
+        "n_kept": n_kept,
+        "n_dropped": n_dropped,
+        "x": x,
+        "y": y,
+        "denom_abs": denom_abs[keep],
+        "truth_sim1": t0[keep],
+        "truth_sim2": t1[keep],
+        "pred_aligned":  pa[keep],
+        "pred_shuffled": ps[keep],
+    }
+    return fig, stats
+
+
+# %%
 figs_by_param = plot_predictions_vs_true_by_noise(focus_params)
 for p_label, fig in figs_by_param.items():
     plt.show()
