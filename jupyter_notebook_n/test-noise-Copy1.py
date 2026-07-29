@@ -5353,7 +5353,8 @@ def plot_pair_normalized_shuffle_scatter(param,
                                             param_labels=None,
                                             perm=None,
                                             drop_degenerate_pairs=True,
-                                            degenerate_eps=1e-8,
+                                            min_pair_distance_frac=0.01,
+                                            degenerate_eps=1e-12,
                                             clip_range=(-3.0, 3.0),
                                             show_diagonal=True,
                                             show_zero_lines=True,
@@ -5395,6 +5396,15 @@ def plot_pair_normalized_shuffle_scatter(param,
 
     Mode: `mode` selects which observable is shuffled (obs1_vs_truth →
     shuffle observable_2; obs2_vs_truth → shuffle observable_1).
+
+    Degeneracy filter is SCALE-INVARIANT across parameters. A pair is dropped
+    if |θ_2 − θ_1| < max(min_pair_distance_frac × range(true), degenerate_eps),
+    where range(true) is the val-set range of the parameter (per call). So the
+    effective threshold auto-adapts to whether the parameter lives in
+    [1e-5, 1e-4] (tiny pair distances) or [10, 100] (large pair distances) --
+    a fixed absolute eps like 1e-8 was meaningless for the small-range
+    parameters and never fired for the large-range ones. degenerate_eps
+    remains as a tiny absolute floor against literal-zero denominators.
 
     Returns (fig, stats).
     """
@@ -5518,15 +5528,26 @@ def plot_pair_normalized_shuffle_scatter(param,
 
     denom_abs = np.abs(t1 - t0)
     n_val = len(pa)
+    # Scale-invariant degeneracy threshold: for each parameter, the "small pair"
+    # cutoff is a FRACTION of the parameter's own true-value range, not a fixed
+    # absolute epsilon. A hardcoded epsilon like 1e-8 is meaningless for a
+    # parameter that lives in [1e-5, 1e-4] (all its pairs are "small" in absolute
+    # terms) and irrelevant for a parameter in [10, 100] (no pair is that small).
+    # degenerate_eps stays as a tiny absolute floor for numerical stability.
+    param_range = float(true_a[:, p_idx].max() - true_a[:, p_idx].min())
+    frac_threshold = min_pair_distance_frac * param_range if drop_degenerate_pairs else 0.0
+    threshold = max(frac_threshold, degenerate_eps)
     if drop_degenerate_pairs:
-        keep = denom_abs > degenerate_eps
+        keep = denom_abs > threshold
     else:
         keep = np.ones_like(denom_abs, dtype=bool)
     n_kept = int(keep.sum()); n_dropped = int((~keep).sum())
     if n_kept == 0:
         raise ValueError(
-            "All pairs are degenerate (|θ_2 − θ_1| ≤ eps). Try a different perm "
-            f"or relax degenerate_eps={degenerate_eps:g}."
+            f"All {n_val} pairs are degenerate (|θ_2 − θ_1| ≤ {threshold:g} = "
+            f"max({min_pair_distance_frac}×range={frac_threshold:g}, "
+            f"degenerate_eps={degenerate_eps:g})). "
+            f"Try a different perm or lower min_pair_distance_frac."
         )
 
     # user's Q5 convention: numerator is (θ̂ − θ_1), i.e. prediction − sim_1 truth
@@ -5576,7 +5597,10 @@ def plot_pair_normalized_shuffle_scatter(param,
         "y = ±1 → shuffled pred is one |θ_2−θ_1| off sim_1's truth",
     ]
     if drop_degenerate_pairs and n_dropped:
-        annot_lines.append(f"dropped {n_dropped} degenerate pairs (|θ_2−θ_1| ≤ {degenerate_eps:g})")
+        annot_lines.append(
+            f"dropped {n_dropped} degenerate pairs "
+            f"(|θ_2−θ_1| ≤ {threshold:.3g}, i.e. {min_pair_distance_frac*100:g}% of {p_label}'s range)"
+        )
     ax.text(0.02, 0.98, "\n".join(annot_lines), transform=ax.transAxes,
             va="top", ha="left", fontsize=8, color="#3C3489",
             bbox=dict(facecolor="white", edgecolor="#B4B2A9",
