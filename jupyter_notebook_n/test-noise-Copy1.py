@@ -5433,20 +5433,37 @@ def plot_pair_normalized_shuffle_scatter(param,
     obs_set = set(obs_pair)
 
     # --- resolve case (default: both-clean combo for this pair) ---
+    # Case NAMES often use short labels ("sfr_0.0_ms_0.0") that don't literally
+    # equal the full observable keys stored in selected_observables
+    # ("SFR_Ms_s61", "Ms_Mh_s61").  Match observables via the case's actual
+    # selected_observables dict; use parse_case_name only for kind + noise.
     case_to_result = {r["case_name"]: r for r in results}
     if case is None:
-        for c in case_to_result:
+        both_clean_candidates = []
+        for c, r in case_to_result.items():
             info = parse_case_name(c)
-            if (info["kind"] == "combo"
+            if not (info["kind"] == "combo"
                     and info.get("noise1") == 0.0
-                    and info.get("noise2") == 0.0
-                    and {info["obs1"], info["obs2"]} == obs_set):
+                    and info.get("noise2") == 0.0):
+                continue
+            selected_c = set(r["selected_observables"])
+            both_clean_candidates.append((c, sorted(selected_c)))
+            if selected_c == obs_set:
                 case = c
                 break
         if case is None:
+            if both_clean_candidates:
+                raise ValueError(
+                    f"No both-clean combo case whose selected_observables == "
+                    f"{sorted(obs_pair)}. Both-clean combos found with other "
+                    f"observables: {both_clean_candidates}. "
+                    f"Pass `case` explicitly or adjust `obs_pair`."
+                )
             raise ValueError(
-                f"No both-clean combo case found containing {sorted(obs_pair)}. "
-                f"Pass `case` explicitly."
+                f"No both-clean combo case in results (no case with "
+                f"parse_case_name kind='combo' and noise1=noise2=0). "
+                f"Pass `case` explicitly. Cases available: "
+                f"{sorted(case_to_result)}"
             )
     if case not in case_to_result:
         raise ValueError(f"Case {case!r} not in results.")
