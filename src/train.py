@@ -91,7 +91,7 @@ def fit(
 
         if restore_best_weights:
             smoothed = val_loss if smoothed is None else alpha * val_loss + (1 - alpha) * smoothed
-            if epoch >= best_weights_smoothing_window and smoothed < best_smoothed:
+            if smoothed < best_smoothed:
                 best_smoothed = smoothed
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 best_epoch = epoch
@@ -157,7 +157,7 @@ def fit_with_epoch_noise(
 
         if restore_best_weights:
             smoothed = val_loss if smoothed is None else alpha * val_loss + (1 - alpha) * smoothed
-            if epoch >= best_weights_smoothing_window and smoothed < best_smoothed:
+            if smoothed < best_smoothed:
                 best_smoothed = smoothed
                 best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 best_epoch = epoch
