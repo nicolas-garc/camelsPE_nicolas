@@ -59,7 +59,7 @@ def fit(
     device: torch.device,
     epochs: int = 10,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    restore_best_weights: bool = True,
+    restore_best_weights: bool = False,
     best_weights_smoothing_window: int = 20,
 ):
     """
@@ -123,7 +123,7 @@ def fit_with_epoch_noise(
     epochs: int = 10,
     train_loader_fn: Optional[Callable[[], DataLoader]] = None,
     scheduler: Optional[torch.optim.lr_scheduler._LRScheduler] = None,
-    restore_best_weights: bool = True,
+    restore_best_weights: bool = False,
     best_weights_smoothing_window: int = 20,
 ):
     """

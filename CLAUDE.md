@@ -10,6 +10,15 @@ question.
 **Main notebook**: `camelsPE/jupyter_notebook_n/test-noise-Copy1.ipynb` (paired
 with `.py` via jupytext — always edit the `.py`).
 
+**Module wiring**: the notebook is a lean driver; the machinery lives in
+`src/pipeline.py` (data/loader/prediction utilities) and `src/plots.py` (all
+plot functions). Both use a `configure(**kwargs)` pattern: the notebook calls
+`pipeline.configure(...)` after the train/val split and
+`plots.configure(...)` after training (passing `all_results`, R² matrices,
+etc.). Plot functions take `param=None`-style keyword args that fall back to
+the configured state, so `plots.plot_bias_progression_overlay(param=4)` just
+works. If you change shared state (e.g. re-run the split), re-call configure.
+
 ---
 
 ## Data
@@ -189,12 +198,17 @@ GAL_SBI/
 │   ├── src/
 │   │   ├── models.py       SimpleMLP (+ WIP VarMLP)
 │   │   ├── train.py        fit, fit_with_epoch_noise, train_one_epoch
-│   │   └── losses.py       MSELoss
+│   │   ├── losses.py       MSELoss
+│   │   ├── pipeline.py     data utilities: add_noise, normalize, shuffle,
+│   │   │                   DataLoader factories, get_case_predictions,
+│   │   │                   average_r2_over_perms, resolve_shuffle
+│   │   └── plots.py        all 23 plot functions extracted from the notebook
 │   ├── jupyter_notebook_n/
-│   │   ├── test-noise-Copy1.{py,ipynb}    ← MAIN NOTEBOOK
+│   │   ├── test-noise-Copy1.{py,ipynb}    ← MAIN NOTEBOOK (lean driver)
 │   │   ├── toy_noise_mechanisms.{py,ipynb} ← linear-Gaussian sandbox
-│   │   ├── Noise_Injection, MomentNetwork, analysis, …
-│   │   └── (unpaired scratch: Untitled*, *-Copy1, older test-*)
+│   │   ├── MomentNetwork.{py,ipynb}       ← moment network experiments
+│   │   ├── toy_model_r2.{py,ipynb}        ← toy model with var/cov functions
+│   │   └── archive/                       ← archived notebooks (analysis, poster)
 │   ├── main.py             script entry point
 │   └── run.sh              SLURM job (HPC)
 ├── noise_results/, results/, grid_results/    ← output plots + R² matrices

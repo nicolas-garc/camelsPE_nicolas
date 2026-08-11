@@ -8,46 +8,62 @@
 #       format_version: '1.3'
 #       jupytext_version: 1.19.4
 #   kernelspec:
-#     display_name: Python 3 (ipykernel)
+#     display_name: py311-main
 #     language: python
 #     name: python3
 # ---
 
+# %% [markdown]
+# # Moment Network — posterior mean + variance per parameter
+#
+# Follows Jeffrey & Wandelt 2020 (arXiv:2011.05991). For each case:
+#   1. Train F(x) with MSE — posterior mean μ (already done by test-noise pipeline).
+#   2. K-fold OOF residuals from F → variance targets v_i = log(r_i²), z-scored.
+#      (OOF because train_loss < val_loss in this project — real overfitting means
+#       naive same-set residuals would understate σ.)
+#   3. Train G(x) on (x_train, v_z) with MSE — G predicts log-variance z-score.
+#   4. At eval: μ = F(x_val); σ = √exp(G(x_val)·std + mean).
+#
+# Marginal posterior plots then show how obs1-only vs obs2-only vs both compare
+# per parameter — the probabilistic version of the R² comparison in test-noise.
+
 # %%
 import sys
+import os
 import importlib
 import numpy as np
 import h5py
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset, random_split
 import matplotlib.pyplot as plt
+plt.rcParams["figure.facecolor"] = "white"
+plt.rcParams["axes.facecolor"] = "white"
 from sklearn.metrics import r2_score, mean_squared_error
-from sklearn.model_selection import KFold
+import pandas as pd
+
 base_path = "../src/"
 sys.path.append(base_path)
 import models
 import train
 from losses import *
+import pipeline
+import plots
 
 # %%
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# %%
-#datafilename='../../DATA/data_L25LH_TNG.hdf5'
-datafilename='../../DATA/data_L50_TNG_v3.hdf5'
-with h5py.File(datafilename, 'r') as f:
-    print("Datasets available:")
-    for key in f.keys():
-        print(key)
+# %% [markdown]
+# ## Data loading (identical to test-noise-Copy1)
 
-with h5py.File(datafilename, 'r') as f:
-    #Parameters = f['Parameters'][0, :1024].T.reshape(-1, 1)
-    Parameters = f['Parameters'][:, :1024].T
+# %%
+datafilename = "../../DATA/data_L50_TNG_v3.hdf5"
+
+with h5py.File(datafilename, "r") as f:
+    Parameters = f["Parameters"][:, :1024].T
+
 logflag = np.array([False, False, True, True, True, True, False, False, False, True, True, False, False, True, False, True, False, True, True, False, False, True, True, True, True, True, True, False, True, False, True, False, False, False, True])
 logflag = logflag[:Parameters.shape[1]]
-origParameters = Parameters
 if not np.all(Parameters[:, logflag] > 0):
     raise ValueError("Some values to be logged are non-positive.")
 PartiallyLoggedParameters = Parameters.copy()
@@ -56,471 +72,214 @@ means = PartiallyLoggedParameters.mean(axis=0)
 stds = PartiallyLoggedParameters.std(axis=0)
 Parameters = (PartiallyLoggedParameters - means) / stds
 
-with h5py.File(datafilename, 'r') as f:
-    Ms_Mh_s90 = f['Ms_Mh_s90'][:].T
-    Ms_Mh_s61 = f['Ms_Mh_s61'][:].T
-    MBH_Mh_s90 = f['MBH_Mh_s90'][:].T
-    MBH_Mh_s61 = f['MBH_Mh_s61'][:].T
-    Mg_Mh_s90 = f['Mg_Mh_s90'][:].T
-    Mg_Mh_s61 = f['Mg_Mh_s61'][:].T
-    Rs_Ms_s90 = f['Rs_Ms_s90'][:].T
-    Rs_Ms_s61 = f['Rs_Ms_s61'][:].T
-    SFR_Ms_s90 = f['SFR_Ms_s90'][:].T
-    SFR_Ms_s61 = f['SFR_Ms_s61'][:].T
-    Zs_Ms_s90 = f['Zs_Ms_s90'][:].T
-    Zs_Ms_s61 = f['Zs_Ms_s61'][:].T
-    SFRH_100Myr = f['SFRH_100Myr'][:].T
+n_sims = Parameters.shape[0]
+with h5py.File(datafilename, "r") as f:
+    observable_block = {
+        key: torch.from_numpy(f[key][:].T).float()
+        for key in sorted(f.keys())
+        if key != "Parameters" and f[key].shape[-1] == n_sims
+    }
+
+# %% [markdown]
+# ## Noise cases — start with the three we need for marginal-posterior comparison
 
 # %%
-#x = torch.cat((torch.from_numpy(Ms_Mh_s90), torch.from_numpy(Ms_Mh_s61)), dim=1).float()
-#x = torch.cat((torch.from_numpy(Ms_Mh_s90), torch.from_numpy(Ms_Mh_s61), torch.from_numpy(MBH_Mh_s90), torch.from_numpy(MBH_Mh_s61), torch.from_numpy(Mg_Mh_s90), torch.from_numpy(Mg_Mh_s61)), dim=1).float()
+noise_cases = {
+    # Reference: obs2 alone (SFR)
+    "sfr_clean": {"SFR_Ms_s61": 0.0},
+    # Reference: obs1 alone (Ms)
+    "ms_clean":  {"Ms_Mh_s61": 0.0},
+    # Both observables, both clean
+    "sfr_0.0_ms_0.0": {"SFR_Ms_s61": 0.0, "Ms_Mh_s61": 0.0},
+    # A noisy pair (optional; comment out to speed up the run)
+    "sfr_1.0_ms_1.0": {"SFR_Ms_s61": 1.0, "Ms_Mh_s61": 1.0},
+}
 
-x = torch.cat((torch.from_numpy(Ms_Mh_s90), torch.from_numpy(Ms_Mh_s61), torch.from_numpy(MBH_Mh_s90), torch.from_numpy(MBH_Mh_s61), torch.from_numpy(Mg_Mh_s90), torch.from_numpy(Mg_Mh_s61), torch.from_numpy(Rs_Ms_s90), torch.from_numpy(Rs_Ms_s61), torch.from_numpy(SFR_Ms_s90), torch.from_numpy(SFR_Ms_s61), torch.from_numpy(Zs_Ms_s90), torch.from_numpy(Zs_Ms_s61)), dim=1).float()
+all_observables = set()
+for case in noise_cases.values():
+    all_observables.update(case.keys())
+x_raw_dict = {key: observable_block[key].numpy() for key in all_observables}
 
-#x = torch.cat((torch.from_numpy(Ms_Mh_s90), torch.from_numpy(Ms_Mh_s61), torch.from_numpy(MBH_Mh_s90), torch.from_numpy(MBH_Mh_s61), torch.from_numpy(Mg_Mh_s90), torch.from_numpy(Mg_Mh_s61), torch.from_numpy(Rs_Ms_s90), torch.from_numpy(Rs_Ms_s61), torch.from_numpy(SFR_Ms_s90), torch.from_numpy(SFR_Ms_s61), torch.from_numpy(Zs_Ms_s90), torch.from_numpy(Zs_Ms_s61), torch.from_numpy(SFRH_100Myr)), dim=1).float()
+_sorted_obs = sorted(all_observables)
+observable_1, observable_2 = _sorted_obs[0], _sorted_obs[1]
+print(f"observable_1 = {observable_1}   observable_2 = {observable_2}")
 
-normalized_data = True
-
-if normalized_data:
-    x_np = x.numpy()
-    x_means = x_np.mean(axis=0)
-    x_stds = x_np.std(axis=0)
-    x_np_norm = (x_np - x_means) / x_stds
-    x = torch.from_numpy(x_np_norm).float()
-else:
-    x = torch.from_numpy(x_np).float()
-
-print("Total NaNs:", torch.isnan(x).sum().item())
-print("Total Infs:", torch.isinf(x).sum().item())
-x[torch.isnan(x)] = 11
-x[torch.isinf(x)] = 11
-print("Total NaNs:", torch.isnan(x).sum().item())
-print("Total Infs:", torch.isinf(x).sum().item())
-
+x_normalized_dict = {k: pipeline.normalize(observable_block[k].numpy()) for k in all_observables}
 y = torch.from_numpy(Parameters).float()
 
-print(x.shape)
-print(y.shape)
+# %% [markdown]
+# ## Hyperparameters & train/val split
 
 # %%
-# Hyperparameters
-input_dim    = x.shape[1]
 output_dim   = y.shape[1]
 hidden_dims  = [128, 64]
-#hidden_dims  = [128, 64, 64]
-#hidden_dims  = [64, 64]
-lr           = 1e-4
-wd           = 1e-5
-dropout_rate = 0.2
-epochs       = 500
-val_fraction = 0.1
+dropout_rate = 0.4      # was 0.2 — bumped to counter overfitting
+wd           = 1e-3     # was 1e-5 — stronger weight decay
+epochs       = 2000
+val_fraction = 0.1        # for training-time model selection (best-weights)
+test_fraction = 0.1       # held out for final unbiased R² / pull calibration
 batch_size   = 64
-separate_models = False
-k_fold = True
-n_folds = 5
+
+# Best-weights restoration (see src/train.py::fit_with_epoch_noise)
+RESTORE_BEST_WEIGHTS = True
+BEST_WEIGHTS_WINDOW  = 50
+
+# Moment-network specific
+K_FOLDS      = 5
+FOLD_EPOCHS  = epochs      # partial-F folds train as thoroughly as the main F
+VAR_EPOCHS   = epochs
+
+n_val = int(n_sims * val_fraction)
+n_test = int(n_sims * test_fraction)
+torch.manual_seed(0); np.random.seed(0)
+split_perm = torch.randperm(n_sims)
+idx_test  = split_perm[:n_test]                                     # held out for final reporting
+idx_val   = split_perm[n_test:n_test + n_val]                        # model selection during training
+idx_train = split_perm[n_test + n_val:]                              # gradient updates
+perm = np.random.permutation(len(idx_test))
+
+# %% [markdown]
+# ## Configure pipeline and plots modules
 
 # %%
-if k_fold:
-    kf = KFold(n_splits=n_folds, shuffle=True)
-    fold_train_losses = []
-    fold_val_losses = []
-else: 
-    full_dataset = DataLoader(TensorDataset(x, y),  batch_size=batch_size, shuffle=False)
-    n_val = int(len(x) * val_fraction)
-    perm = torch.randperm(len(x))
-    idx_train = perm[:-n_val]
-    idx_val = perm[-n_val:]
-    x_train, y_train = x[idx_train], y[idx_train]
-    x_val, y_val = x[idx_val], y[idx_val]
+importlib.reload(train); importlib.reload(models); importlib.reload(pipeline); importlib.reload(plots)
 
+pipeline.configure(
+    observable_1=observable_1, observable_2=observable_2,
+    x_normalized_dict=x_normalized_dict, x_raw_dict=x_raw_dict,
+    y=y, idx_val=idx_val, idx_test=idx_test, idx_train=idx_train,
+    batch_size=batch_size, device=device,
+    logflag=logflag, means=means, stds=stds, output_dim=output_dim,
+    hidden_dims=hidden_dims, dropout_rate=dropout_rate, epochs=epochs,
+    perm=perm,
+)
 
-
-# %%
-importlib.reload(train)
-importlib.reload(models)
+# %% [markdown]
+# ## Train F* per case (mean net — same as test-noise pipeline)
 
 # %%
-# model, optimizer, loss function
-criterion = MSELoss()
-if separate_models and output_dim > 1:
-    models_list = [models.SimpleMLP(input_dim, hidden_dims, 1, dropout_rate).to(device) for _ in range(output_dim)]
-    optimizers = [optim.Adam(m.parameters(), lr=lr, weight_decay=wd) for m in models_list]
-else:
+all_results = []
+for case_name, selected_observables in noise_cases.items():
+    print(f"\n=== Training F* for {case_name} ===")
+    input_dim = sum(x_raw_dict[k].shape[1] for k in selected_observables)
     model = models.SimpleMLP(input_dim, hidden_dims, output_dim, dropout_rate).to(device)
-    optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
+    optimizer = optim.Adam(model.parameters(), lr=1e-4, weight_decay=wd)
+    criterion = nn.MSELoss()
+
+    train_loader_fn = pipeline.make_train_loader_fn(
+        selected_observables, x_normalized_dict, y, idx_train, batch_size)
+    val_loader = pipeline.make_val_loader_fn(
+        selected_observables, x_normalized_dict, y, idx_val, batch_size)()
+
+    train_losses, val_losses = train.fit_with_epoch_noise(
+        model=model, train_loader=None, train_loader_fn=train_loader_fn,
+        val_loader=val_loader, optimizer=optimizer, criterion=criterion,
+        device=device, epochs=epochs,
+        restore_best_weights=RESTORE_BEST_WEIGHTS,
+        best_weights_smoothing_window=BEST_WEIGHTS_WINDOW,
+    )
+    all_results.append({
+        "case_name": case_name,
+        "selected_observables": selected_observables,
+        "model": model,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+    })
+
+pipeline.configure(all_results=all_results)
+
+# %% [markdown]
+# ## Diagnostic — R² per case (sanity check before the variance net)
 
 # %%
-if k_fold: 
-    model_list = []
-    out_of_fold_preds = np.zeros_like(y)
-    for fold_idx, (train_idx, val_idx) in enumerate(kf.split(x)):
-        print(f"Fold {fold_idx + 1}")
-    
-        # Split data
-        x_train_fold = x[train_idx]
-        y_train_fold = y[train_idx]
-        x_val_fold = x[val_idx]
-        y_val_fold = y[val_idx]
-    
-        # Create DataLoaders
-        train_loader = DataLoader(TensorDataset(x_train_fold, y_train_fold), shuffle=True)
-        val_loader = DataLoader(TensorDataset(x_val_fold, y_val_fold), batch_size, shuffle = False)
-        # New model and optimizer
-        model = models.SimpleMLP(input_dim, hidden_dims, output_dim, dropout_rate).to(device)
-        optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
-    
-        # Train
-        train_loss, val_loss = train.fit(model, train_loader, val_loader, optimizer, criterion, device, epochs)
-        model_list.append(model)
-        fold_train_losses.append(train_loss)
-        fold_val_losses.append(val_loss)
+r2_matrix = np.zeros((len(all_results), output_dim))
+for ri, r in enumerate(all_results):
+    preds, trues = pipeline.get_case_predictions(r, mode="aligned")
+    r2_matrix[ri] = r2_score(trues, preds, multioutput="raw_values")
 
+param_names = [f"θ{j}" for j in range(output_dim)]
+print(pd.DataFrame(r2_matrix,
+                   index=[r["case_name"] for r in all_results],
+                   columns=param_names).round(2))
 
-    train_losses = np.mean(np.stack(fold_train_losses), axis=0)
-    val_losses = np.mean(np.stack(fold_val_losses), axis=0)
-        
-    
+# %% [markdown]
+# ## Fit G (variance head) per case — this is the moment-network step
+#
+# Each call does K-fold retraining of F on train subsets (for OOF residuals), then
+# trains G on (x_train, log-variance z-scored). Attaches `var_model`, `var_target_mean`,
+# `var_target_std` to the result dict.
+#
+# Time budget: K × fold_epochs mean-net trainings + 1 G training per case.
 
 # %%
+FOCUS_PARAMS_FOR_MOMENT = ["θ0", "θ1", "θ2", "θ4", "θ7", "θ11"]
+
+for r in all_results:
+    print(f"\n=== Fitting moment head M for {r['case_name']} ===")
+    pipeline.fit_moment_head(
+        r, FOCUS_PARAMS_FOR_MOMENT,
+        models_module=models, train_module=train,
+        K=K_FOLDS, fold_epochs=FOLD_EPOCHS, moment_epochs=VAR_EPOCHS,
+        wd=wd,
+        restore_best_weights=RESTORE_BEST_WEIGHTS,
+        best_weights_smoothing_window=BEST_WEIGHTS_WINDOW,
+    )
+
+# %% [markdown]
+# ## Configure plots module (needs the fitted var_models on all_results)
 
 # %%
-# Predict on validation fold
-true_val = np.zeros_like(y)
+plots.configure(
+    all_results=all_results, output_dim=output_dim,
+    observable_1=observable_1, observable_2=observable_2,
+    logflag=logflag, means=means, stds=stds,
+    x_normalized_dict=x_normalized_dict, y=y,
+    idx_val=idx_val, idx_test=idx_test,
+    param_names=param_names, noise_cases=noise_cases,
+    batch_size=batch_size, device=device, perm=perm,
+    r2_matrix=r2_matrix,
+)
 
-
-
-for fold_idx, (train_idx, val_idx) in enumerate(kf.split(x)):
-    print(f"Fold {fold_idx + 1}")
-
-    # Split data
-    x_train_fold = x[train_idx]
-    y_train_fold = y[train_idx]
-    x_val_fold = x[val_idx]
-    y_val_fold = y[val_idx]
-
-    val_loader = DataLoader(TensorDataset(x_val_fold, y_val_fold), batch_size, shuffle = False)
-    
-    model = model_list[fold_idx]
-    model.eval()
-    preds_list = []
-    true_list = []
-    with torch.no_grad():
-        for batch_x, batch_y in val_loader:
-            batch_x = batch_x.to(device)
-            batch_y = batch_y.to(device)
-            batch_preds = model(batch_x)
-            preds_list.append(batch_preds.cpu())
-            true_list.append(batch_y.cpu())
-            
-    preds_fold = np.vstack(preds_list)
-    true_fold = np.vstack(true_list)
-    
-    # Store predictions in correct positions
-    out_of_fold_preds[val_idx] = preds_fold
-    true_val[val_idx] = true_fold
-
-print(out_of_fold_preds, "\n")
-print(true_val)
-
-predictions = out_of_fold_preds
-true_values = true_val
-
-predictions = predictions * stds + means
-true_values = true_values * stds + means
-predictions[:, logflag] = np.exp(predictions[:, logflag])
-true_values[:, logflag] = np.exp(true_values[:, logflag])
-
-# Compute residuals
-residuals = true_values  - predictions
-#variance 
-variance_targets = residuals**2
+# %% [markdown]
+# ## Marginal posteriors — the payoff plots
+#
+# For a single validation sim, overlay p(θ|x) Gaussians from each case. Shows
+# how the obs1-only, obs2-only, and both-clean models constrain each parameter
+# differently. `space="log_partial"` = standardized log space (Gaussianity is
+# honest here for log parameters).
 
 # %%
+CASES = list(noise_cases.keys())
+FOCUS_PARAMS = ["θ0", "θ1", "θ2", "θ4", "θ7", "θ11"]
 
+# Single-sim, single-parameter comparison
+for p in FOCUS_PARAMS[:3]:
+    plots.plot_marginal_posterior_1d(p, sim_idx=0, cases=CASES, space="log_partial")
+    plt.show()
 
-
-# %%
-train_losses_list, val_losses_list = [], []
-if not k_fold:
-        if separate_models and output_dim > 1:
-            for i, (model_i, opt_i) in enumerate(zip(models_list, optimizers)):
-                print(f"model #{i:d}")
-                tl, vl = train.fit(
-                    model_i,
-                    DataLoader(TensorDataset(x_train, y_train[:, i:i+1]), batch_size=batch_size, shuffle=True),
-                    DataLoader(TensorDataset(x_val, y_val[:, i:i+1]), batch_size=batch_size, shuffle=False),
-                    opt_i, criterion, device, epochs)
-                train_losses_list.append(tl)
-                val_losses_list.append(vl)
-            train_losses = np.mean(np.stack(train_losses_list), axis=0)
-            val_losses = np.mean(np.stack(val_losses_list), axis=0)
-            
-        else: 
-            train_loader = DataLoader(TensorDataset(x_train, y_train), batch_size=batch_size, shuffle=True)
-            val_loader = DataLoader(TensorDataset(x_val, y_val), batch_size=batch_size, shuffle=False)
-            train_losses, val_losses = train.fit(model, train_loader, val_loader, optimizer, criterion, device, epochs)
+# %% [markdown]
+# ### Grid: multiple sims × chosen cases, one param per figure
 
 # %%
-plt.figure(figsize=(10, 6))
-epochs_range = range(1, epochs + 1)
-plt.plot(epochs_range, train_losses, label='Training Loss')
-plt.plot(epochs_range, val_losses, label='Validation Loss')
-plt.title('Training and Validation Loss')
-plt.xlabel('Epoch')
-plt.ylabel('MSE Loss')
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-#plt.savefig("../../../plots/training_plot.png")
+for p in FOCUS_PARAMS:
+    plots.plot_marginal_posterior_grid(p, cases=CASES, n_sims=6, seed=42,
+                                        space="log_partial")
+    plt.show()
+
+# %% [markdown]
+# ### Population σ per case per parameter (bar chart)
+
+# %%
+plots.plot_sigma_by_case_bars(FOCUS_PARAMS, CASES, space="log_partial",
+                               reducer="median")
 plt.show()
 
-# %%
-if not k_fold: 
-    model.eval()
-    predictions, true_values = [], []
-    
-    with torch.no_grad():
-        for xb, yb in full_dataset:
-            xb, yb = xb.to(device), yb.to(device)
-            preds = model(xb)
-            
-            predictions.append(preds.cpu())
-            true_values.append(yb.cpu())
-    
-    predictions = torch.cat(predictions).numpy()
-    true_values = torch.cat(true_values).numpy()
-    
-    
-    
-    predictions = predictions * stds + means
-    true_values = true_values * stds + means
-    predictions[:, logflag] = np.exp(predictions[:, logflag])
-    true_values[:, logflag] = np.exp(true_values[:, logflag])
-    #additional step for second moment netowrk
-    residuals = true_values - predictions
-
-    # Variances
-    variance_targets = residuals**2  
+# %% [markdown]
+# ### Calibration diagnostic — pull = (μ − true) / σ
+# Well-calibrated → histogram matches N(0,1). std >> 1 → over-confident (σ too small).
 
 # %%
-
-"""
-# Covariances
-from itertools import combinations
-
-for i, j in combinations(range(all_predictions.shape[1]), 2):
-    cov = residuals[:, i] * residuals[:, j]
-    covariances.append(cov[:, None])
-if covariances:
-    covariance_targets = np.hstack(covariances)  # [N, C]
-    var_targets = np.hstack([variance_targets, covariance_targets])
-else:
-    var_targets = variance_targets  # Only variances if 1 parameter"""
-
-
-variance_targets = np.log(variance_targets)
-mean = variance_targets.mean(axis = 0)
-std = variance_targets.mean(axis = 0)
-
-variance_targets = (variance_targets - mean)/std
-
-#print(variance_targets[idx_train].mean(axis = 0))
-
-#print(variance_targets[idx_val].mean(axis = 0))
-
-
-
-var_targets = torch.from_numpy(variance_targets).float()
-
-
-
-#print("training set variance: \n", variance_targets[idx_train].mean(axis = 0))
-
-#print("validation set variance: \n" ,variance_targets[idx_val].mean(axis = 0))
-print("Final target shape:", var_targets.shape)
-
-# %%
-#now run the variance network
-
-n_val = int(len(x) * 0.1)
-perm = torch.randperm(len(x))
-idx_train = perm[:-n_val]
-idx_val = perm[-n_val:]
-
-
-x_train, var_train = x[idx_train], var_targets[idx_train]
-x_val, var_val = x[idx_val], var_targets[idx_val]
-
-
-
-
-# %%
-print(x_train.shape)
-
-# %%
-print(var_train.shape)
-
-# %%
-
-# %%
-# Hyperparameters for variance
-input_dim    = x.shape[1]
-output_dim   = var_targets.shape[1]
-#hidden_dims  = [128, 64]
-hidden_dims  = [64, 64, 32]
-#hidden_dims  = [64, 64]
-lr           = 1e-4
-wd           = 1e-4
-dropout_rate = 0.4
-epochs       = 500
-val_fraction = 0.1
-batch_size   = 64
-separate_models = False
-
-# %%
-
-var_network = models.SimpleMLP(input_dim, hidden_dims, output_dim, dropout_rate).to(device)
-optimizer = optim.Adam(var_network.parameters(), lr=lr, weight_decay=wd)
-criterion = MSELoss()
-
-var_train_loader = DataLoader(TensorDataset(x_train, var_train), batch_size=batch_size, shuffle=True)
-var_val_loader = DataLoader(TensorDataset(x_val, var_val), batch_size=batch_size, shuffle=False)
-var_train_losses, var_val_losses = train.fit(var_network, var_train_loader, var_val_loader, optimizer, criterion, device, epochs)
-
-
-# %%
-plt.figure(figsize=(10, 6))
-epochs_range = range(1, epochs + 1)
-plt.plot(epochs_range, var_train_losses, label='Training Loss')
-plt.plot(epochs_range, var_val_losses, label='Validation Loss')
-plt.title('Training and Validation Loss For Variance')
-plt.xlabel('Epoch')
-plt.ylabel('MSE Loss')
-plt.legend()
-plt.grid(True)
-plt.tight_layout()
-#plt.savefig("../../training_plot_unnormalized.png")
+plots.plot_pull_distribution(CASES, space="normalized", params=FOCUS_PARAMS)
 plt.show()
-
-# %%
-#predictions[idx_val]
-
-# %% [raw]
-# model.eval()
-# predictions, true_values = [], []
-#
-# with torch.no_grad():
-#     for xb, yb in val_loader:
-#         xb, yb = xb.to(device), yb.to(device)
-#         preds = model(xb)
-#         
-#         predictions.append(preds.cpu())
-#         true_values.append(yb.cpu())
-#
-# all_predictions = torch.cat(predictions).numpy()
-# all_true_values = torch.cat(true_values).numpy()
-#
-# all_predictions = all_predictions * stds + means
-# all_true_values = all_true_values * stds + means
-# all_predictions[:, logflag] = np.exp(all_predictions[:, logflag])
-# all_true_values[:, logflag] = np.exp(all_true_values[:, logflag])
-
-# %%
-var_network.eval()
-predicted_variances, true_variances  = [], []
-
-with torch.no_grad():
-    for xb, yb in var_val_loader:
-        xb, yb = xb.to(device), yb.to(device)
-        preds = var_network(xb)
-        
-        predicted_variances.append(preds.cpu())
-        true_variances.append(yb.cpu())
-
-predicted_variances = torch.cat(predicted_variances).numpy()
-true_variances = torch.cat(true_variances).numpy()
-
-
-
-# %%
-# Reverse the normalization
-pred_log_var = predicted_variances * std + mean
-
-# Reverse the log transform
-predicted_variances = np.exp(pred_log_var)
-
-
-
-
-# %%
-all_predictions = predictions[idx_val]
-all_true_values = true_values[idx_val]
-
-# %%
-# Create figure with subplots
-Npanels=[5,7]
-#Npanels=[3,2]
-fig, axes = plt.subplots(nrows=Npanels[0], ncols=Npanels[1], figsize=(25, 25))
-
-for i in range(Npanels[0]):
-    for j in range(Npanels[1]):
-        ax = axes[i, j]
-
-        idx = i * Npanels[1] + j
-
-        predictions = all_predictions[:, idx]
-        true_values = all_true_values[:, idx]
-        pred_var = predicted_variances[:, idx]
-        pred_std = np.sqrt(np.maximum(pred_var, 0))  # make sure variances are non-negative
-
-        r2 = r2_score(true_values, predictions)
-        rmse = np.sqrt(mean_squared_error(true_values, predictions))
-
-        # Plot scatter with error bars in Y (predictions)
-        ax.errorbar(
-            true_values,              # x data
-            predictions,              # y data
-            yerr=pred_std,            # error bars (±1σ)
-            fmt='o',                  # point marker
-            alpha=0.6,
-            ecolor='gray',
-            elinewidth=1,
-            capsize=2,
-            markersize=4
-        )
-
-        # Plot ideal prediction line
-        min_val = min(true_values.min(), predictions.min())
-        max_val = max(true_values.max(), predictions.max())
-        ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
-
-        ax.set_xlabel('True Values')
-        ax.set_ylabel('Predicted Values')
-        ax.set_title(f'R² = {r2:.3f}, RMSE = {rmse:.3f}')
-        ax.grid(True)
-
-        ax.set_xlim(
-            origParameters.min(axis=0)[idx] - (origParameters.max(axis=0)[idx] - origParameters.min(axis=0)[idx]) * 0.1,
-            origParameters.max(axis=0)[idx] + (origParameters.max(axis=0)[idx] - origParameters.min(axis=0)[idx]) * 0.1
-        )
-        ax.set_ylim(
-            origParameters.min(axis=0)[idx] - (origParameters.max(axis=0)[idx] - origParameters.min(axis=0)[idx]) * 0.1,
-            origParameters.max(axis=0)[idx] + (origParameters.max(axis=0)[idx] - origParameters.min(axis=0)[idx]) * 0.1
-        )
-
-plt.tight_layout()
-plt.savefig("../../results_plot_unnormalized_with_errorbars.png")
-plt.show()
-
-
-# %%
-#chi square test
-
-
-
-
-chi_square = np.cumsum(variances)
-
-
 
 # %%

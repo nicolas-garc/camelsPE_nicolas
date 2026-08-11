@@ -173,3 +173,13 @@ cython_debug/
 
 # slurm
 .out
+
+# macOS
+.DS_Store
+
+# sweep-generated output (models, R2 results, plots, logs) — regenerate via
+# jupyter_notebook_n/sweep/generate_sweep.py + run_all.sh; not checked in
+jupyter_notebook_n/sweep/*/results/
+jupyter_notebook_n/sweep/logs/
+jupyter_notebook_n/sweep/moment_example/
+jupyter_notebook_n/sweep/moment_network/
