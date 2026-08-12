@@ -144,13 +144,25 @@ def sample_posterior(result, x_obs, n_samples=5000, show_progress=False):
 
 
 def predict_moments_from_samples(result, *, indices=None, n_samples=2000,
-                                   space="normalized"):
+                                   space="normalized", mode="aligned", perm=None):
     """For each test sim, sample the posterior and compute empirical (μ, Σ).
+
+    mode: "aligned" | "obs1_vs_truth" | "obs2_vs_truth" — same shuffle-test
+      semantics as pipeline.resolve_shuffle/get_case_predictions. "obs1_vs_truth"
+      shuffles observable_2's rows (via `perm`) before feeding the posterior,
+      truths stay unpermuted — R² (from the posterior mean) survives only if
+      the flow actually reads observable_1. "obs2_vs_truth" is the dual (shuffles
+      observable_1). Keys are intersected with this case's observables, so
+      single-observable reference cases fall out as natural no-ops, exactly like
+      the mean-net shuffle test.
+    perm: permutation over local positions in `indices`. Required for a
+      reproducible/averaged shuffle; if omitted and mode != "aligned", a fresh
+      random permutation is drawn.
 
     Returns:
       mu:    [N, k]     empirical mean of posterior samples per sim
       cov:   [N, k, k]  empirical covariance
-      truth: [N, k]     ground truth for each sim
+      truth: [N, k]     ground truth for each sim (never shuffled)
       samples_per_sim:  [N, n_samples, k]  raw samples (for non-Gaussian analysis)
     """
     if indices is None:
@@ -161,11 +173,18 @@ def predict_moments_from_samples(result, *, indices=None, n_samples=2000,
     k = len(focus_indices)
     N = len(indices)
 
-    # Build clean x_test for the case's observables — evaluation is always on clean
+    keys_to_shuffle, _ = _pipeline.resolve_shuffle(result["selected_observables"], mode)
+    if keys_to_shuffle and perm is None:
+        perm = np.random.permutation(N)
+
+    # Build x_test for the case's observables — clean, except keys_to_shuffle
+    # (mode != "aligned"), which get their rows permuted. Truths stay put.
     x_list = []
     keys_sorted = sorted(result["selected_observables"].keys())
     for key in keys_sorted:
         arr = _pipeline.x_normalized_dict[key][indices]
+        if key in keys_to_shuffle:
+            arr = arr[perm]
         x_list.append(torch.from_numpy(arr).float())
     x_test = torch.cat(x_list, dim=1)   # [N, input_dim]
 
@@ -196,13 +215,215 @@ def predict_moments_from_samples(result, *, indices=None, n_samples=2000,
     raise ValueError(f"space must be 'normalized' or 'log_partial'; got {space!r}")
 
 
+def sbi_shuffle_r2(result, mode, *, indices=None, n_samples=1000, space="log_partial"):
+    """R² of the posterior mean vs truth under a shuffle mode, averaged over
+    several independent shuffle draws.
+
+    SBI analog of pipeline.average_r2_over_perms: the point estimate here is
+    the posterior mean (empirical, from re-sampling the flow at the chimera x
+    each draw), not a single deterministic forward pass, so each perm draw
+    means both a fresh row-permutation AND fresh posterior samples.
+
+    Returns:
+      r2_mean, r2_std: [k] arrays — mean/std R² per focus param across draws.
+      If mode == "aligned", there's one draw (no randomness to average over)
+      and r2_std is all zeros.
+    """
+    from sklearn.metrics import r2_score
+    if indices is None:
+        indices = np.asarray(_pipeline._eval_indices())
+    indices = np.asarray(indices)
+    N = len(indices)
+
+    n_draws = 1 if mode == "aligned" else 5
+    draws = []
+    for d in range(n_draws):
+        perm = None if mode == "aligned" else np.random.default_rng(d).permutation(N)
+        mu, _, truth, _ = predict_moments_from_samples(
+            result, indices=indices, n_samples=n_samples, space=space,
+            mode=mode, perm=perm)
+        draws.append(r2_score(truth, mu, multioutput="raw_values"))
+    draws = np.stack(draws, axis=0)
+    return draws.mean(axis=0), draws.std(axis=0)
+
+
+# ---------------------------------------------------------------------------
+# Fit-quality diagnostics — is the trained flow any good, independent of
+# whether it's reading the right observable (that's what sbi_shuffle_r2 is for).
+# ---------------------------------------------------------------------------
+
+
+def plot_sbi_loss_curves(result, *, figsize=(6, 4)):
+    """Train/val loss (NPE-C's internal MLE loss) per epoch for one case.
+
+    Cheapest possible sanity check — no resampling, just the numbers
+    fit_sbi_posterior already stored. Read it as:
+      - val loss still dropping at the last epoch -> stop_after_epochs/max_epochs
+        cut training short, consider raising them.
+      - val well above train for a long stretch -> overfitting.
+      - NaN/inf anywhere -> unstable training, usually prior_bound too tight
+        or learning_rate too high.
+    """
+    import matplotlib.pyplot as plt
+
+    tl = result.get("sbi_train_losses") or []
+    vl = result.get("sbi_val_losses") or []
+    fig, ax = plt.subplots(figsize=figsize)
+    if tl:
+        ax.plot(range(1, len(tl) + 1), tl, label="train", color="steelblue")
+    if vl:
+        ax.plot(range(1, len(vl) + 1), vl, label="val", color="darkorange")
+    ax.set_xlabel("epoch", fontsize=9)
+    ax.set_ylabel("NPE-C loss", fontsize=9)
+    ax.set_title(f"SBI loss curves — {result['case_name']}", fontsize=10)
+    ax.legend(fontsize=8, frameon=False)
+    fig.tight_layout()
+    return fig
+
+
+def compute_sbc_ranks(result, *, indices=None, n_samples=1000, space="log_partial"):
+    """Simulation-based calibration ranks (Talts et al. 2018): for each
+    held-out test sim, the rank of the true theta among n_samples posterior
+    draws, per focus param. A well-calibrated posterior gives ranks uniformly
+    distributed in [0, n_samples] across the test set — this works directly
+    on the raw samples, so unlike a Gaussian pull test it doesn't require (or
+    assume) the posterior is Gaussian-shaped.
+
+    Returns:
+      ranks: [N, k] int array, each entry in [0, n_samples]
+      labels: focus param names
+    """
+    _, _, truth, samples = predict_moments_from_samples(
+        result, indices=indices, n_samples=n_samples, space=space)
+    ranks = (samples < truth[:, None, :]).sum(axis=1)   # [N, k]
+    labels = result.get("sbi_focus_params") or result.get("moment_focus_params") \
+             or [f"θ{i}" for i in range(ranks.shape[1])]
+    return ranks, labels
+
+
+def plot_sbc_rank_hist(result, *, indices=None, n_samples=1000, space="log_partial",
+                        n_bins=None, figsize_per_panel=3.2):
+    """SBC rank histogram, one panel per focus param. Ranks should be uniform
+    if the posterior is well-calibrated:
+      - U-shaped (piled up at both ends)  -> posterior too narrow (overconfident)
+      - hump in the middle                -> posterior too wide (underconfident)
+      - skewed to one side                -> biased mean
+
+    The shaded band is the ~95% expected range under perfect calibration
+    (normal approximation to Binomial(N, 1/n_bins)) — bars poking outside it
+    are likely real miscalibration, not just sampling noise from a modest
+    test-set size.
+    """
+    import matplotlib.pyplot as plt
+
+    ranks, labels = compute_sbc_ranks(result, indices=indices, n_samples=n_samples, space=space)
+    N, k = ranks.shape
+    n_bins = n_bins or max(5, min(20, N // 5))
+
+    fig, axes = plt.subplots(1, k, figsize=(figsize_per_panel * k, figsize_per_panel), squeeze=False)
+    axes = axes[0]
+    bin_edges = np.linspace(0, n_samples, n_bins + 1)
+    expected = N / n_bins
+    band = 1.96 * np.sqrt(N * (1 / n_bins) * (1 - 1 / n_bins))
+
+    for i in range(k):
+        ax = axes[i]
+        ax.axhspan(expected - band, expected + band, color="grey", alpha=0.25,
+                   label="95% band" if i == 0 else None)
+        ax.axhline(expected, color="grey", linewidth=1.0, linestyle="--")
+        ax.hist(ranks[:, i], bins=bin_edges, color="steelblue", alpha=0.8, edgecolor="white")
+        ax.set_title(labels[i], fontsize=9)
+        ax.set_xlabel("rank", fontsize=8)
+        if i == 0:
+            ax.set_ylabel("count", fontsize=8)
+            ax.legend(fontsize=7, frameon=False)
+
+    fig.suptitle(f"SBC rank histogram — case {result['case_name']}  ({space}, N={N} test sims, "
+                 f"n_samples={n_samples})\nUniform = calibrated. U-shape = overconfident. Hump = underconfident.",
+                 fontsize=10, y=1.05)
+    fig.tight_layout()
+    return fig
+
+
+def plot_sbc_coverage(result, *, indices=None, n_samples=1000, space="log_partial",
+                       figsize=(5, 5)):
+    """Empirical vs. nominal coverage, aggregated across the test set — the
+    same rank information as plot_sbc_rank_hist, condensed to one diagonal-line
+    plot instead of a histogram grid. On the y=x line -> calibrated; below it
+    -> overconfident (credible intervals too narrow, real value falls outside
+    them more often than claimed); above it -> underconfident.
+    """
+    import matplotlib.pyplot as plt
+
+    ranks, labels = compute_sbc_ranks(result, indices=indices, n_samples=n_samples, space=space)
+    N, k = ranks.shape
+    frac_rank = ranks / n_samples
+    levels = np.linspace(0.01, 0.99, 50)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot([0, 1], [0, 1], "k--", linewidth=1.0, label="ideal")
+    cmap = plt.get_cmap("tab10")
+    for i in range(k):
+        empirical = [np.mean(np.abs(frac_rank[:, i] - 0.5) <= level / 2) for level in levels]
+        ax.plot(levels, empirical, color=cmap(i), linewidth=1.6, label=labels[i])
+    ax.set_xlabel("nominal credible level", fontsize=9)
+    ax.set_ylabel("empirical coverage", fontsize=9)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+    ax.legend(fontsize=8, frameon=False)
+    ax.set_title(f"SBC coverage — case {result['case_name']}  ({space}, N={N})", fontsize=10)
+    fig.tight_layout()
+    return fig
+
+
 # ---------------------------------------------------------------------------
 # Generalizable corner plots — beyond single-sim views.
 # ---------------------------------------------------------------------------
 
 
+def _mode_tag(mode):
+    return "" if mode == "aligned" else f"  [SHUFFLE: {mode}]"
+
+
+def _corner_grid(k, figsize_per_panel):
+    """Shared k×k corner-plot scaffold: axes grid with the upper triangle hidden."""
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(k, k, figsize=(figsize_per_panel * k, figsize_per_panel * k),
+                              squeeze=False)
+    for i in range(k):
+        for j in range(k):
+            if j > i:
+                axes[i, j].set_visible(False)
+    return fig, axes
+
+
+def _corner_finish(fig, axes, labels):
+    """Shared corner-plot finishing: border axis labels + aggregate legend."""
+    k = len(labels)
+    for i in range(k):
+        for j in range(k):
+            if j > i:
+                continue
+            ax = axes[i, j]
+            if i == k - 1: ax.set_xlabel(labels[j], fontsize=8)
+            else: ax.set_xticklabels([])
+            if j == 0 and i > 0: ax.set_ylabel(labels[i], fontsize=8)
+            elif j > 0: ax.set_yticklabels([])
+
+    handles, lbls = [], []
+    seen = set()
+    for a in axes.flat:
+        for h, l in zip(*a.get_legend_handles_labels()):
+            if l and l not in seen:
+                handles.append(h); lbls.append(l); seen.add(l)
+    if handles:
+        fig.legend(handles, lbls, loc="upper right", frameon=False, fontsize=9,
+                   bbox_to_anchor=(0.98, 0.98))
+    fig.tight_layout()
+
+
 def plot_sbi_pull_corner(result, *, indices=None, n_samples=1000,
-                          space="log_partial", figsize_per_panel=1.7):
+                          space="log_partial", figsize_per_panel=1.7,
+                          mode="aligned", perm=None):
     """Joint pull calibration corner. For each test sim compute pull z_i =
     (θ_true - μ_sample) / σ_sample, then draw the k×k corner of z across all
     test sims. If perfectly calibrated (unbiased μ, correct Σ), every panel is
@@ -214,6 +435,9 @@ def plot_sbi_pull_corner(result, *, indices=None, n_samples=1000,
     marginally, the joint uncertainty structure is off.
 
     One plot summarizes the whole test set. Population-level calibration.
+
+    mode/perm: pass "obs1_vs_truth" or "obs2_vs_truth" to see calibration
+    collapse under the shuffle test (see predict_moments_from_samples).
     """
     import matplotlib.pyplot as plt
     from scipy.stats import norm
@@ -223,7 +447,8 @@ def plot_sbi_pull_corner(result, *, indices=None, n_samples=1000,
     indices = np.asarray(indices)
 
     mu, cov, truth, _ = predict_moments_from_samples(
-        result, indices=indices, n_samples=n_samples, space=space)
+        result, indices=indices, n_samples=n_samples, space=space,
+        mode=mode, perm=perm)
     sigma = np.sqrt(np.clip(np.diagonal(cov, axis1=1, axis2=2), 1e-30, None))
     pull = (truth - mu) / sigma                # [N, k]
 
@@ -273,7 +498,7 @@ def plot_sbi_pull_corner(result, *, indices=None, n_samples=1000,
             if j == 0 and i > 0: ax.set_ylabel(labels[i], fontsize=8)
             elif j > 0: ax.set_yticklabels([])
 
-    fig.suptitle(f"Pull-corner — case {result['case_name']}  ({space})\n"
+    fig.suptitle(f"Pull-corner — case {result['case_name']}  ({space}){_mode_tag(mode)}\n"
                   f"Diagonals: 1D pull. Off-diagonals: 2D pull scatter (well-calib → isotropic, r≈0)",
                   fontsize=10, y=0.995)
     fig.tight_layout()
@@ -282,26 +507,30 @@ def plot_sbi_pull_corner(result, *, indices=None, n_samples=1000,
 
 def plot_sbi_multi_sim_corner(result, sim_indices, *, n_samples=2000,
                                 space="log_partial", figsize_per_panel=1.7,
-                                show_true=True, cmap_name="tab10"):
+                                show_true=True, cmap_name="tab10",
+                                mode="aligned", perm=None):
     """Overlay corner-plot samples from multiple test sims in one figure.
 
     For each chosen sim, samples the posterior and draws its diagonal (1D histogram)
     and off-diagonal (2D scatter). Different sims in different colors. Shows how
     much the posterior *shape* varies across x (as opposed to per-sim, which shows
     the shape for ONE x).
+
+    mode/perm: pass "obs1_vs_truth" or "obs2_vs_truth" to see how posterior
+    shape/location degrades under the shuffle test (see predict_moments_from_samples).
     """
     import matplotlib.pyplot as plt
 
     sim_indices = list(sim_indices)
     all_indices = np.asarray(_pipeline._eval_indices())
     _, _, truth, samples_all = predict_moments_from_samples(
-        result, indices=all_indices, n_samples=n_samples, space=space)
+        result, indices=all_indices, n_samples=n_samples, space=space,
+        mode=mode, perm=perm)
     labels = result.get("sbi_focus_params") or result.get("moment_focus_params") \
              or [f"θ{i}" for i in range(samples_all.shape[-1])]
     k = samples_all.shape[-1]
 
-    fig, axes = plt.subplots(k, k, figsize=(figsize_per_panel * k, figsize_per_panel * k),
-                              squeeze=False)
+    fig, axes = _corner_grid(k, figsize_per_panel)
     cmap = plt.get_cmap(cmap_name)
 
     # Global axis limits from all shown sims
@@ -320,7 +549,7 @@ def plot_sbi_multi_sim_corner(result, sim_indices, *, n_samples=2000,
         for i in range(k):
             for j in range(k):
                 if j > i:
-                    axes[i, j].set_visible(False); continue
+                    continue
                 ax = axes[i, j]
                 if i == j:
                     ax.hist(S[:, i], bins=30, density=True, histtype="step",
@@ -345,22 +574,58 @@ def plot_sbi_multi_sim_corner(result, sim_indices, *, n_samples=2000,
                 ax.grid(True, alpha=0.2)
             else:
                 ax.set_yticks([])
-            if i == k - 1: ax.set_xlabel(labels[j], fontsize=8)
-            else: ax.set_xticklabels([])
-            if j == 0 and i > 0: ax.set_ylabel(labels[i], fontsize=8)
-            elif j > 0: ax.set_yticklabels([])
 
-    # Aggregate legend
-    handles, lbls = [], []
-    seen = set()
-    for a in axes.flat:
-        for h, l in zip(*a.get_legend_handles_labels()):
-            if l and l not in seen:
-                handles.append(h); lbls.append(l); seen.add(l)
-    if handles:
-        fig.legend(handles, lbls, loc="upper right", frameon=False, fontsize=9,
-                   bbox_to_anchor=(0.98, 0.98))
+    _corner_finish(fig, axes, labels)
     fig.suptitle(f"Multi-sim corner overlay — {len(sim_indices)} test sims, "
-                  f"case {result['case_name']}", fontsize=10, y=0.995)
-    fig.tight_layout()
+                  f"case {result['case_name']}{_mode_tag(mode)}", fontsize=10, y=0.995)
+    return fig
+
+
+def plot_sbi_case_overlay_corner(results, sim_idx, *, n_samples=5000, space="log_partial",
+                                   figsize_per_panel=1.8, cmap_name="tab10", case_labels=None):
+    """Overlay posterior samples from several trained CASES at one test sim,
+    one color per case. Dual of plot_sbi_multi_sim_corner (which overlays
+    several sims for one case) — this overlays several cases for one sim, e.g.
+    to compare how the posterior shape changes as observables are added/noised.
+
+    results: list of trained result dicts (each needs sbi_posterior).
+    case_labels: optional display names, same order as results (defaults to
+    each result's case_name).
+    """
+    import matplotlib.pyplot as plt
+
+    per_case = []
+    for r in results:
+        _, _, truth, samples = predict_moments_from_samples(
+            r, indices=None, n_samples=n_samples, space=space)
+        per_case.append((samples[sim_idx], truth[sim_idx]))
+    labels = results[0].get("sbi_focus_params") or results[0].get("moment_focus_params") \
+             or [f"θ{i}" for i in range(per_case[0][0].shape[-1])]
+    k = len(labels)
+    truth_vec = per_case[0][1]   # same sim -> same truth regardless of case
+    case_labels = case_labels or [r["case_name"] for r in results]
+
+    fig, axes = _corner_grid(k, figsize_per_panel)
+    cmap = plt.get_cmap(cmap_name)
+
+    for c_idx, (S, _truth) in enumerate(per_case):
+        color = cmap(c_idx)
+        for i in range(k):
+            for j in range(k):
+                if j > i:
+                    continue
+                ax = axes[i, j]
+                if i == j:
+                    ax.hist(S[:, i], bins=40, density=True, histtype="step",
+                             color=color, linewidth=1.4,
+                             label=case_labels[c_idx] if i == 0 else None)
+                    ax.axvline(truth_vec[i], color="red", linestyle="--", linewidth=1.0, alpha=0.7)
+                else:
+                    ax.scatter(S[:, j], S[:, i], s=1, alpha=0.05, color=color)
+                    ax.plot(truth_vec[j], truth_vec[i], "x", color="red",
+                             markersize=9, markeredgewidth=1.6)
+
+    _corner_finish(fig, axes, labels)
+    fig.suptitle(f"SBI posterior samples — val sim #{sim_idx}  (real distribution, not Gaussian)",
+                  fontsize=10, y=0.995)
     return fig

@@ -316,12 +316,7 @@ def run_moment_example(obs_a, obs_b, out_dir, *, epochs=500,
     x_normalized_dict = {k: pipeline.normalize(observable_block[k].numpy()) for k in all_observables}
 
     # 4-case set: obs1-alone, obs2-alone, both-clean, both-moderate-noise
-    noise_cases = {
-        "A_clean": {obs1: 0.0},
-        "B_clean": {obs2: 0.0},
-        "B_0.0_A_0.0": {obs2: 0.0, obs1: 0.0},
-        "B_1.0_A_1.0": {obs2: 1.0, obs1: 1.0},
-    }
+    noise_cases = pipeline.default_sbi_reference_cases(obs1, obs2)
 
     output_dim = y.shape[1]
     n_val = int(len(y) * val_fraction)
@@ -432,12 +427,7 @@ def run_hetero_example(obs_a, obs_b, out_dir, *, epochs=1000,
     x_raw_dict = {k: observable_block[k].numpy() for k in all_observables}
     x_normalized_dict = {k: pipeline.normalize(observable_block[k].numpy()) for k in all_observables}
 
-    noise_cases = {
-        "A_clean": {obs1: 0.0},
-        "B_clean": {obs2: 0.0},
-        "B_0.0_A_0.0": {obs2: 0.0, obs1: 0.0},
-        "B_1.0_A_1.0": {obs2: 1.0, obs1: 1.0},
-    }
+    noise_cases = pipeline.default_sbi_reference_cases(obs1, obs2)
 
     output_dim = y.shape[1]
     n_val = int(len(y) * val_fraction)
@@ -535,12 +525,12 @@ def run_sbi_example(obs_a, obs_b, out_dir, *,
     x_raw_dict = {k: observable_block[k].numpy() for k in all_observables}
     x_normalized_dict = {k: pipeline.normalize(observable_block[k].numpy()) for k in all_observables}
 
-    noise_cases = {
-        "A_clean": {obs1: 0.0},
-        "B_clean": {obs2: 0.0},
-        "B_0.0_A_0.0": {obs2: 0.0, obs1: 0.0},
-        "B_1.0_A_1.0": {obs2: 1.0, obs1: 1.0},
-    }
+    # Also used by _analyze_helpers.train_sbi_for_pair — the in-process,
+    # Agg-free SBI trainer for interactive notebooks (this module forces the
+    # Agg matplotlib backend at import time, which breaks inline Jupyter
+    # plotting, so that trainer deliberately avoids importing it and keeps
+    # its own copy of the split/case-setup logic).
+    noise_cases = pipeline.default_sbi_reference_cases(obs1, obs2)
 
     output_dim = y.shape[1]
     n_val = int(len(y) * val_fraction)

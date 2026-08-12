@@ -114,6 +114,32 @@ class PairContext(types.SimpleNamespace):
         print(f"  Focus params for plots: θ0, θ1, θ2, θ4, θ7, θ11 (adjust as needed)")
 
 
+def _make_split(y, val_fraction, test_fraction, seed):
+    """3-way train/val/test split (2-way if test_fraction<=0, for older
+    results.pt saved before the held-out test set existed). Shared by
+    load_pair and train_sbi_for_pair so the two can't drift apart on split
+    semantics.
+
+    Returns (idx_train, idx_val, idx_test, perm), where perm permutes the
+    eval set (idx_test if present, else idx_val) for the shuffle test.
+    """
+    n_val = int(len(y) * val_fraction)
+    n_test = int(len(y) * test_fraction)
+    torch.manual_seed(seed); np.random.seed(seed)
+    split_perm = torch.randperm(len(y))
+    if n_test > 0:
+        idx_test = split_perm[:n_test]
+        idx_val = split_perm[n_test:n_test + n_val]
+        idx_train = split_perm[n_test + n_val:]
+        perm = np.random.permutation(len(idx_test))
+    else:
+        idx_test = None
+        idx_train = split_perm[:-n_val]
+        idx_val = split_perm[-n_val:]
+        perm = np.random.permutation(len(idx_val))
+    return idx_train, idx_val, idx_test, perm
+
+
 def load_pair(pair_idx=None, pair_dir=None, results_path=None,
               val_fraction=None, test_fraction=None, seed=None):
     """Load a saved pair's results.pt and reconfigure pipeline + plots modules.
@@ -146,21 +172,7 @@ def load_pair(pair_idx=None, pair_dir=None, results_path=None,
     val_fraction = val_fraction if val_fraction is not None else saved.get("val_fraction", 0.1)
     test_fraction = test_fraction if test_fraction is not None else saved.get("test_fraction", 0.0)
     seed = seed if seed is not None else saved.get("seed", 0)
-    n_val = int(len(y) * val_fraction)
-    n_test = int(len(y) * test_fraction)
-    torch.manual_seed(seed); np.random.seed(seed)
-    split_perm = torch.randperm(len(y))
-    if n_test > 0:
-        idx_test  = split_perm[:n_test]
-        idx_val   = split_perm[n_test:n_test + n_val]
-        idx_train = split_perm[n_test + n_val:]
-        perm = np.random.permutation(len(idx_test))
-    else:
-        # Older 2-way-split results.pt (test_fraction=0). Preserve original layout.
-        idx_test  = None
-        idx_train = split_perm[:-n_val]
-        idx_val   = split_perm[-n_val:]
-        perm = np.random.permutation(len(idx_val))
+    idx_train, idx_val, idx_test, perm = _make_split(y, val_fraction, test_fraction, seed)
 
     obs1, obs2 = saved["obs1"], saved["obs2"]
     x_raw_dict = {k: observable_block[k].numpy() for k in (obs1, obs2)}
@@ -228,6 +240,99 @@ def load_pair(pair_idx=None, pair_dir=None, results_path=None,
         # old flags keep working
         has_variance=any("moment_model" in r for r in all_results),
         has_covariance=any("moment_model" in r for r in all_results),
+        # stashed so a later train_sbi_for_pair(...) call in the same kernel
+        # can reuse this HDF5 read instead of paying for it again
+        loaded_data=dict(y=y, logflag=logflag, means=means, stds=stds,
+                          observable_block=observable_block),
+    )
+    return ctx
+
+
+def train_sbi_for_pair(obs_a, obs_b, focus_params, *, noise_cases=None,
+                        density_estimator="maf", hidden_features=100, num_transforms=8,
+                        training_batch_size=64, learning_rate=5e-4,
+                        validation_fraction=0.1, stop_after_epochs=100, max_epochs=2000,
+                        prior_bound=6.0, val_fraction=0.1, test_fraction=0.1, seed=0,
+                        loaded_data=None):
+    """Train NPE-C/MAF posteriors for one pair on the given focus params, entirely
+    in-process — deliberately does NOT import _pair_pipeline (which calls
+    matplotlib.use("Agg") at module import and kills inline plotting for the
+    rest of the kernel). Safe to call from a live Jupyter cell.
+
+    No plotting here, nothing saved to disk — pipe the returned PairContext
+    into sbi_pipeline's plot_* / sbi_shuffle_r2 functions yourself, inline.
+
+    focus_params: list of param names/indices to fit the flow on (see
+    pipeline._resolve_focus_indices for accepted forms) — the whole point of
+    the checkpoint workflow is that you choose these by hand after reviewing
+    the noise-sweep R2 heatmaps from load_pair(), not all 35 at once.
+
+    noise_cases defaults to the standard 4-case SBI reference set (A_clean,
+    B_clean, both-clean, both-moderately-noisy) — pass your own dict to match
+    a different set of cases.
+
+    loaded_data: pass ctx.loaded_data from an earlier load_pair() call in the
+    same kernel to skip re-reading the HDF5 file (same dataset either way —
+    the split is independent of and redone from val_fraction/test_fraction/seed).
+    """
+    import sbi_pipeline as sbi_pl   # heavy import (torch + sbi), local to this call
+
+    if loaded_data is not None:
+        y, logflag, means, stds, observable_block = (
+            loaded_data["y"], loaded_data["logflag"], loaded_data["means"],
+            loaded_data["stds"], loaded_data["observable_block"])
+    else:
+        y, logflag, means, stds, observable_block = _load_data()
+    obs1, obs2 = sorted([obs_a, obs_b])
+    all_observables = {obs1, obs2}
+    x_raw_dict = {k: observable_block[k].numpy() for k in all_observables}
+    x_normalized_dict = {k: pipeline.normalize(observable_block[k].numpy()) for k in all_observables}
+
+    if noise_cases is None:
+        noise_cases = pipeline.default_sbi_reference_cases(obs1, obs2)
+
+    output_dim = y.shape[1]
+    idx_train, idx_val, idx_test, perm = _make_split(y, val_fraction, test_fraction, seed)
+
+    pipeline.configure(
+        observable_1=obs1, observable_2=obs2,
+        x_normalized_dict=x_normalized_dict, x_raw_dict=x_raw_dict,
+        y=y, idx_val=idx_val, idx_test=idx_test, idx_train=idx_train,
+        batch_size=training_batch_size, device=torch.device("cpu"),
+        logflag=logflag, means=means, stds=stds, output_dim=output_dim,
+        hidden_dims=[128, 64], dropout_rate=0.4, epochs=max_epochs,
+        perm=perm,
+    )
+
+    all_results = []
+    for i, (case_name, selected_observables) in enumerate(noise_cases.items()):
+        print(f"  [{i+1}/{len(noise_cases)}] SBI training {case_name}  "
+              f"observables={selected_observables}")
+        result = {"case_name": case_name, "selected_observables": selected_observables}
+        sbi_pl.fit_sbi_posterior(
+            result, focus_params=list(focus_params),
+            density_estimator=density_estimator,
+            hidden_features=hidden_features, num_transforms=num_transforms,
+            training_batch_size=training_batch_size, learning_rate=learning_rate,
+            validation_fraction=validation_fraction,
+            stop_after_epochs=stop_after_epochs, max_epochs=max_epochs,
+            prior_bound=prior_bound, seed=seed,
+        )
+        all_results.append(result)
+    pipeline.configure(all_results=all_results)
+
+    param_names = [f"θ{j}" for j in range(output_dim)]
+    ctx = PairContext(
+        obs_a=obs_a, obs_b=obs_b, obs1=obs1, obs2=obs2,
+        noise_cases=noise_cases, cases=list(noise_cases.keys()),
+        all_results=all_results,
+        r2_matrix=None, r2_matrix_shifted_obs=None, r2_matrix_shifted_both=None,
+        r2_std_matrix_shifted_obs=None, r2_std_matrix_shifted_both=None,
+        param_names=param_names,
+        display_names=pretty_case_names({"obs1": obs1, "obs2": obs2, "noise_cases": noise_cases}),
+        pair_dir=None, results_dir=None,
+        pipeline=pipeline, plots=plots,
+        has_moment=False, has_variance=False, has_covariance=False,
     )
     return ctx
 

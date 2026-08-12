@@ -195,6 +195,20 @@ def sample_unique_unordered_pairs(n_val, n_pairs, *, seed=0):
     return np.array(out, dtype=int)
 
 
+def default_sbi_reference_cases(obs1, obs2):
+    """Standard 4-case SBI reference set: each observable alone, both clean,
+    both moderately noisy. Shared by _pair_pipeline.run_sbi_example and
+    _analyze_helpers.train_sbi_for_pair so the two SBI entry points can't
+    silently drift apart on what "the reference cases" means.
+    """
+    return {
+        "A_clean": {obs1: 0.0},
+        "B_clean": {obs2: 0.0},
+        "B_0.0_A_0.0": {obs2: 0.0, obs1: 0.0},
+        "B_1.0_A_1.0": {obs2: 1.0, obs1: 1.0},
+    }
+
+
 # ---------------------------------------------------------------------------
 # Stateful functions (use module-level variables set via configure).
 # ---------------------------------------------------------------------------
