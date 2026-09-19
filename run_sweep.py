@@ -70,6 +70,25 @@ LOGFLAG_MASK = np.array([False, False, True, True, True, True, False, False, Fal
                          False, True])
 N_SIMS = 1024
 N_SHUFFLE_PERMS = 10
+# Searched in order when --data is not given: the copy shipped with the repo
+# first, then the layout used in the original working tree.
+DATA_CANDIDATES = ("data/data_L50_TNG_v3.hdf5", "../DATA/data_L50_TNG_v3.hdf5")
+
+
+def resolve_data(path):
+    """Return the data file, with an actionable message if it isn't there."""
+    if path:
+        if not os.path.exists(path):
+            raise SystemExit(f"--data file not found: {path}")
+        return path
+    for cand in DATA_CANDIDATES:
+        full = os.path.join(HERE, cand)
+        if os.path.exists(full):
+            return full
+    raise SystemExit(
+        "Training data not found. Looked for:\n  "
+        + "\n  ".join(os.path.join(HERE, c) for c in DATA_CANDIDATES)
+        + "\nPass --data /path/to/data_L50_TNG_v3.hdf5")
 
 
 def noise_cases_for(obs1, obs2):
@@ -486,7 +505,8 @@ def plot_summary(D, pair_list, out):
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--data", default=os.path.join(HERE, "..", "DATA", "data_L50_TNG_v3.hdf5"))
+    ap.add_argument("--data", default=None,
+                    help=f"HDF5 training data (default: first of {', '.join(DATA_CANDIDATES)})")
     ap.add_argument("--out", default=os.path.join(HERE, "sweep_output"))
     ap.add_argument("--pairs", type=int, nargs="*", default=None,
                     help="pair indices to run (default: all); printed at startup")
@@ -546,6 +566,7 @@ def main(argv=None):
 
     t_start = time.time()
     device = get_device()
+    args.data = resolve_data(args.data)
     y, logflag, means, stds, x_raw, x_norm = load_data(args.data)
     idx_train, idx_val, idx_test, perm = make_split(len(y), args.val_fraction,
                                                     args.test_fraction, args.seed)
@@ -556,6 +577,7 @@ def main(argv=None):
 
     all_pairs = list(combinations(sorted(x_raw), 2))   # sorted -> (obs1, obs2)
     todo = all_pairs if args.pairs is None else [all_pairs[i] for i in args.pairs]
+    print(f"data={args.data}")
     print(f"device={device}  threads={threads or 'default'}  sims={len(y)}  "
           f"train/val/test={len(idx_train)}/{len(idx_val)}/{len(idx_test)}")
     print(f"{len(x_raw)} observables -> {len(all_pairs)} pairs; running {len(todo)}")

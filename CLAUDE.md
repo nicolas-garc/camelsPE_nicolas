@@ -200,9 +200,12 @@ diagnostics can.
 ```
 GAL_SBI/
 ├── DATA/
-│   └── data_L50_TNG_v3.hdf5    ← training data (default --data path)
+│   └── data_L50_TNG_v3.hdf5    ← original location (still used if data/ is absent)
 └── camelsPE/                    ← git repo (remote is YongseokJo/camelsPE)
     ├── CLAUDE.md
+    ├── README.md           handoff instructions for whoever runs the sweep
+    ├── requirements.txt
+    ├── data/               data_L50_TNG_v3.hdf5 (3.4 MB, shipped so a clone runs)
     ├── run_sweep.py        ← THE script: train → features → plots, all pairs
     ├── run_sweep.sh        SLURM wrapper (resubmit to resume)
     ├── src/

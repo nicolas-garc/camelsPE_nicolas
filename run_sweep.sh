@@ -1,35 +1,43 @@
 #!/bin/bash
+# Full observable-pair sweep: trains every pair, saves models, feature vectors
+# and plots into sweep_output/. One continuous run.
+#
+#   sbatch run_sweep.sh
+#
+# If the job hits the time limit, resubmit the exact same command: pairs whose
+# models are already saved are loaded instead of retrained, so it continues
+# where it stopped and writes into the same output directory.
+#
+# ==> EDIT THE THREE MARKED SECTIONS BELOW FOR YOUR CLUSTER. <==
+
 #SBATCH --job-name=camels-sweep
-#SBATCH --time=72:00:00
-#SBATCH -p gpu
-#SBATCH -C a100
+#SBATCH --time=48:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --gpus-per-node=1
-#SBATCH --cpus-per-task=12
-#SBATCH --output=logs/sweep_%j.out
-#SBATCH --error=logs/sweep_%j.err
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --output=sweep_%j.out
+#SBATCH --error=sweep_%j.err
 
-# Full observable-pair sweep in one run: trains every pair, saves models,
-# writes feature vectors and per-parameter plots to sweep_output/.
-#
-#   mkdir -p logs && sbatch run_sweep.sh
-#
-# If the job hits the time limit, resubmit the same command: pairs with saved
-# models are loaded instead of retrained, so it continues into the same output.
-# Adjust the module/env lines below for your cluster.
+### EDIT 1 — partition / GPU.
+# The models are small MLPs; a GPU helps but is not required (the script picks
+# CUDA when available and falls back to CPU). Uncomment and adjust if you want
+# a GPU, and set your site's partition name:
+###SBATCH -p gpu
+###SBATCH --gpus-per-node=1
+
+set -euo pipefail
 
 pwd; hostname; date
 
-module add python
-module add cuda
-module add cudnn
-# source /path/to/your/venv/bin/activate
+### EDIT 2 — environment. Replace with whatever makes python + the packages in
+### requirements.txt available on your cluster. Examples:
+# module load python/3.11 cuda cudnn
+# source /path/to/venv/bin/activate
+# conda activate camels
 
-cd "$SLURM_SUBMIT_DIR"
-python -u run_sweep.py \
-    --data "${DATA:-../DATA/data_L50_TNG_v3.hdf5}" \
-    --out  "${OUT:-sweep_output}" \
-    "$@"
+### EDIT 3 — nothing usually, but --data can point elsewhere if you did not
+### use the data file shipped in data/.
+python -u run_sweep.py --out "${OUT:-sweep_output}" "$@"
 
 date
