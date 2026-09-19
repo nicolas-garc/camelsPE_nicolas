@@ -6,18 +6,23 @@ observables share information** about those parameters. Most of the machinery
 here (noise cases, shuffle test, six-case taxonomy) exists to answer that
 question.
 
-**Repo**: `camelsPE/` (git). Working branch: `notebook-shuffle-fixes`.
-**Main notebook**: `camelsPE/jupyter_notebook_n/test-noise-Copy1.ipynb` (paired
-with `.py` via jupytext — always edit the `.py`).
+**Repo**: `camelsPE/` (git). Branch: `hpc-sweep` — a stripped-down HPC
+version. Notebooks, the moment network, heteroscedastic and SBI code live on
+`moment-network`.
+**Entry point**: `run_sweep.py` — one continuous script with four stages:
+`train` (every observable pair) -> `features` (a vector per pair×parameter)
+-> `plots` (consolidated summary for all 35 parameters) -> `cluster` (embed
+and group the feature space). `run_sweep.sh` is the SLURM wrapper, with
+`--array` sharding.
 
-**Module wiring**: the notebook is a lean driver; the machinery lives in
-`src/pipeline.py` (data/loader/prediction utilities) and `src/plots.py` (all
-plot functions). Both use a `configure(**kwargs)` pattern: the notebook calls
-`pipeline.configure(...)` after the train/val split and
-`plots.configure(...)` after training (passing `all_results`, R² matrices,
-etc.). Plot functions take `param=None`-style keyword args that fall back to
-the configured state, so `plots.plot_bias_progression_overlay(param=4)` just
-works. If you change shared state (e.g. re-run the split), re-call configure.
+**Module wiring**: `run_sweep.py` is the driver; the machinery lives in
+`src/pipeline.py` (data/loader/prediction utilities) and `src/plots.py` (the
+per-parameter plot functions the sweep uses). Both use a `configure(**kwargs)`
+pattern: `run_sweep.configure_modules()` calls both per pair (before training,
+after training, after R²). Plot functions take `param=None`-style keyword args
+that fall back to the configured state, so
+`plots.plot_prediction_attractor_map(param="θ4")` just works. If you change
+shared state (e.g. re-run the split), re-call configure.
 
 ---
 
@@ -43,11 +48,11 @@ works. If you change shared state (e.g. re-run the split), re-call configure.
 - **Loss**: MSE in normalized-log space. R² is scored in linear space after
   `np.exp()` for the ~21 logged parameters. This asymmetry between training
   space and evaluation space is a known open item.
-- **Moment network** (two-stage): first MLP predicts parameter means, then a
-  second MLP is trained on `residuals² → log → standardized` targets to
-  predict per-parameter variance. This gives you a direct readout of learned
-  posterior width — worth leaning on when discussing "how much the model
-  narrows the prior."
+- **Training**: Adam (lr 1e-4, wd 1e-3), dropout 0.3, 1500 epochs, best
+  weights restored by EMA-smoothed val loss (window 50). Split 80/10/10:
+  val selects weights, test is used for all R² and shuffle numbers.
+- The moment network (posterior-width head) is not part of this branch; see
+  `moment-network`.
 
 ## The noise-mixing experiment
 
@@ -56,12 +61,13 @@ assign each a noise level (interpreted as std). A fresh model is trained for
 each case; noise is re-sampled every training epoch (`fit_with_epoch_noise`),
 validation always uses clean data.
 
-Naming convention in `noise_cases`: e.g. `"sfr_5.0_ms_0.0"` means SFR-side
-noise 5.0, Ms-side noise 0.0. Reference cases `sfr_clean` and `ms_clean`
-contain only one observable each (both at noise 0).
+Naming convention (`run_sweep.noise_cases_for`): `"B_5.0_A_0.0"` means noise
+5.0 on observable_2 (B) and 0.0 on observable_1 (A). Reference cases
+`B_clean` / `A_clean` contain only one observable each. Plots swap these for
+the real observable names via `display_names` / `relabel`.
 
 **Deliberate design**: noise is added to the already-normalized observable and
-**not renormalized** afterwards (`add_noise`, not "add_noise_and_normalize").
+**not renormalized** afterwards (`train.fit_with_epoch_noise`).
 See the noise section below for the rationale — this has been re-derived
 several times and should not be "fixed."
 
@@ -75,16 +81,14 @@ model actually read?" Implementation lives in `resolve_shuffle`:
 - **S₂ = `obs2_vs_truth`**: shuffle **observable_1** at validation; truths
   stay put. R² survives only if the model reads observable_2.
 
-The two loops populate `r2_matrix_shifted_observable_only` (S₁) and
-`r2_matrix_shifted_both` (S₂). The naming of the second matrix is legacy —
-it no longer literally shuffles "both." It's the dual of S₁.
+`run_sweep.evaluate_pair` stores these as `r2["shuf_obs2"]` (S₁) and
+`r2["shuf_obs1"]` (S₂), each averaged over 10 permutations of the test set
+(std in `*_std`). `plots.configure` still receives them under the legacy
+names `r2_matrix_shifted_observable_only` / `r2_matrix_shifted_both`.
 
-**observable_1 and observable_2** are derived once from
-`sorted(all_observables)[:2]` (deterministic across kernel restarts;
-matches the column layout the model actually sees). Editing `noise_cases` to
-use different observables auto-propagates. If you want a specific pair
-comparison that isn't alphabetically first/second, override the two names by
-hand.
+**observable_1 and observable_2** are the alphabetically sorted pair
+(`combinations(sorted(...), 2)` in `run_sweep.py`), which matches the column
+layout the model actually sees.
 
 ### `resolve_shuffle` — the canonical rule
 
@@ -110,10 +114,10 @@ This handles the reference cases correctly with no special-case skips:
 
 | shuffle | case | truth-aligned obs in case? | result | mechanism |
 |---|---|---|---|---|
-| S₁ (shuffle obs2) | `ms_clean` | yes | **aligned** | no-op (obs2 absent) |
-| S₁ (shuffle obs2) | `sfr_clean` | no | **collapse** | shuffle obs2, only input destroyed |
-| S₂ (shuffle obs1) | `sfr_clean` | yes | **aligned** | no-op (obs1 absent) |
-| S₂ (shuffle obs1) | `ms_clean` | no | **collapse** | shuffle obs1, only input destroyed |
+| S₁ (shuffle obs2) | `A_clean` | yes | **aligned** | no-op (obs2 absent) |
+| S₁ (shuffle obs2) | `B_clean` | no | **collapse** | shuffle obs2, only input destroyed |
+| S₂ (shuffle obs1) | `B_clean` | yes | **aligned** | no-op (obs1 absent) |
+| S₂ (shuffle obs1) | `A_clean` | no | **collapse** | shuffle obs1, only input destroyed |
 
 **The invariant**: R² collapses whenever the truth-aligned observable is
 missing (the model has nothing to fall back on); R² stays aligned whenever
@@ -121,10 +125,13 @@ the truth-aligned observable is present.
 
 ## Noise: do NOT renormalize after adding it
 
-`add_noise(array_np, noise_level)` adds `N(0, noise_level)` to an
-already-normalized observable and **deliberately does not renormalize**. This
+`train.fit_with_epoch_noise` adds `N(0, noise_level)` to the
+already-normalized observable, per column, and **deliberately does not
+renormalize**. (This used to be `pipeline.add_noise`, called from a per-epoch
+DataLoader; the noise draw now happens on the device inside the loop.) This
 choice has been analyzed on a linear toy (see
-`jupyter_notebook_n/toy_noise_mechanisms.py`) and validated. Do not "fix" it.
+`jupyter_notebook_n/toy_noise_mechanisms.py` on the `moment-network`
+branch) and validated. Do not "fix" it.
 
 The two clean-val schemes learn the identical mapping —
 `w_current × sqrt(1+σ²) = w_renorm` exactly at every σ. The difference at
@@ -192,52 +199,82 @@ diagnostics can.
 ```
 GAL_SBI/
 ├── DATA/
-│   └── data_L50_TNG_v3.hdf5    ← primary training data
-├── camelsPE/                    ← git repo (remote is YongseokJo/camelsPE)
-│   ├── CLAUDE.md           ← this file
-│   ├── src/
-│   │   ├── models.py       SimpleMLP (+ WIP VarMLP)
-│   │   ├── train.py        fit, fit_with_epoch_noise, train_one_epoch
-│   │   ├── losses.py       MSELoss
-│   │   ├── pipeline.py     data utilities: add_noise, normalize, shuffle,
-│   │   │                   DataLoader factories, get_case_predictions,
-│   │   │                   average_r2_over_perms, resolve_shuffle
-│   │   └── plots.py        all 23 plot functions extracted from the notebook
-│   ├── jupyter_notebook_n/
-│   │   ├── test-noise-Copy1.{py,ipynb}    ← MAIN NOTEBOOK (lean driver)
-│   │   ├── toy_noise_mechanisms.{py,ipynb} ← linear-Gaussian sandbox
-│   │   ├── MomentNetwork.{py,ipynb}       ← moment network experiments
-│   │   ├── toy_model_r2.{py,ipynb}        ← toy model with var/cov functions
-│   │   └── archive/                       ← archived notebooks (analysis, poster)
-│   ├── main.py             script entry point
-│   └── run.sh              SLURM job (HPC)
-├── noise_results/, results/, grid_results/    ← output plots + R² matrices
-└── (poster PNGs, older versions in original_code/)
+│   └── data_L50_TNG_v3.hdf5    ← training data (default --data path)
+└── camelsPE/                    ← git repo (remote is YongseokJo/camelsPE)
+    ├── CLAUDE.md
+    ├── run_sweep.py        ← THE script: train → features → plots → cluster
+    ├── cluster_params.py   embedding + clustering stage (also standalone)
+    ├── run_sweep.sh        SLURM wrapper (resubmit to resume; --array shards)
+    ├── src/
+    │   ├── models.py       SimpleMLP
+    │   ├── train.py        fit_with_epoch_noise — device-resident loop
+    │   ├── pipeline.py     normalize, eval loaders, resolve_shuffle,
+    │   │                   get_case_predictions, average_r2_over_perms
+    │   ├── features.py     per-(pair, parameter) feature vectors
+    │   └── plots.py        the consolidated-summary panels
+    └── sweep_output/       (gitignored) models/ tables/ features/ plots/ clusters/
 ```
+
+## Running
+
+- Everything: `python run_sweep.py` (or `sbatch run_sweep.sh`). 14
+  observables → 91 pairs × 7 cases × 1500 epochs, then 35 summary figures
+  per pair.
+- Resumable: pairs with `sweep_output/models/<pair>.pt` are skipped;
+  `--overwrite` retrains. `--stages train,features` etc. runs a subset;
+  `--shard I/N` splits pairs across a SLURM array.
+- Smoke test: `python run_sweep.py --epochs 5 --pairs 0 --out /tmp/smoke`.
+- Rough cost: plotting is ~40 s per pair (~1 h total) and ~18 MB per pair
+  (~1.6 GB total); training dominates wall-clock.
+
+## Downstream goal: clustering the parameter behavior
+
+The point of sweeping every pair is to categorize (pair, parameter)
+combinations **algorithmically** instead of by eye. The plots are kept for
+human verification, but the clustering runs on feature vectors, not images —
+a CNN over rendered PNGs would encode axis limits and point density and give
+no interpretable reason for a grouping.
+
+`src/features.py` turns each consolidated summary into ~41 numbers:
+
+| Panel | Features |
+|---|---|
+| dual R² curve | per-case aligned R², both single-observable R², gain from combining, degradation along each noise arm, curvature (cliff vs graceful) |
+| attractor map | per-case slope of predicted vs true (shrinkage toward the prior) |
+| shuffle scatters | where chimera predictions land between kept and swapped truth: median, IQR, fraction tracking each side, allegiance |
+| pair-truth scatters | off-line distance from the anchor truth — the chimera extrapolation a 1D allegiance score misses |
+
+`cluster_params.py` then z-scores, runs PCA, embeds (UMAP if installed, else
+t-SNE), and clusters (HDBSCAN if installed, else KMeans with k chosen by
+silhouette). It writes cluster labels per (pair, parameter), a cluster-profile
+heatmap saying what defines each group, a cross-tab against
+`features.rule_based_case` (the six-case rules as a crude anchor), and copies
+each cluster's medoid figures into `clusters/medoids/` so a cluster can be
+named by looking at the plots it contains.
+
+Both fall back gracefully when UMAP/HDBSCAN are missing, so the stage never
+blocks an HPC run.
 
 ## Code style
 
-- **Simple, readable, notebook-flat**. Favor top-to-bottom cells over classes
+- **Simple, readable, flat**. Plain functions in `run_sweep.py`, no classes
   or config frameworks. Match the idioms already in the repo.
 - **Minimize tests**. Verify by running the analysis and inspecting outputs
   (losses, R² values, plots, tensor shapes). Not by writing unit-test suites.
 - **Comments**: light and physical (what/why), matching existing density.
-- **Jupytext workflow**: edit the `.py`, then
-  `python3 -m jupytext --sync <name>.ipynb` to update the paired notebook.
-  Don't hand-edit `.ipynb` JSON.
 
 ## Things Claude has previously "fixed" that should stay as-is
 
 Recording these to prevent future sessions from re-flagging them:
 
-1. **`add_noise` doesn't renormalize.** Deliberate; see noise section above.
+1. **Noise isn't renormalized after being added.** Deliberate; see the
+   noise section above.
 2. **Train loss > val loss** on plots. Not overfitting — train is on noisy
    input, val on clean. Consequence of design (1).
-3. **`add_noise` uses `array_np = array_np + noise`, not `+=`**. Prevents
-   accidental corruption of `x_normalized_dict` if called on an unindexed
-   array. Numerically identical at all current call sites.
-4. **`observable_1`/`observable_2` from `sorted(all_observables)[:2]`, not
-   `list(...)[0/1]`**. The latter was hash-randomized between kernel restarts.
+3. **Noise is drawn fresh every epoch**, not once up front, and validation
+   and test inputs stay clean.
+4. **`observable_1`/`observable_2` are the alphabetically sorted pair**, which
+   matches the column order the model is fed.
 5. **ΔR² heatmaps compute `shifted − original`** (negative = information
    lost). This is the user's chosen convention; the labels match.
 6. **Single-observable reference cases produce collapse in one shuffle
@@ -245,14 +282,16 @@ Recording these to prevent future sessions from re-flagging them:
 
 ## Open items (not yet addressed)
 
-- **Permutation averaging**: shuffle R² currently uses a single perm draw.
-  At val size ~102, per-cell jitter is meaningful. Averaging over K=50 perms
-  (no retraining needed) would give mean + std per cell.
 - **R² space mismatch**: model trains on MSE in normalized-log space; R² is
   computed in linear space after `exp()`. For logged parameters, R² is
   dominated by the tail.
-- **Loss-curve interpretation**: label the plots as "train (noisy input) vs
-  val (clean input)" to prevent the val-below-train reading as no-overfit.
-- **Consolidate `noise_cases` documentation**: names like `sfr_5.0_ms_0.0`
-  encode which observable each noise level applies to; make this explicit
-  somewhere.
+- **Feature set is a first pass**: the vectors cover the four panel types
+  but nothing about per-parameter posterior width (that would need the
+  moment network from `moment-network`).
+- **Cluster count is data-driven, not validated**: silhouette picks k, and
+  the rule-based cross-tab is a sanity anchor, not ground truth. Hand-label
+  a sample of medoids to check the grouping means what you think.
+- **Short-name collisions in scatter plots**: `plots.py`'s `short_of` uses
+  the first token of the observable name, so same-quantity pairs (e.g.
+  `MBH_Mh_s61 × MBH_Mh_s90`) are both labeled "MBH" in the shuffle and
+  pair-truth scatter panels.
