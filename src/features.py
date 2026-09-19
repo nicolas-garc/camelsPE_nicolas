@@ -11,10 +11,10 @@ off `consolidated_param_summary`:
   off-line      how far chimera predictions sit from the anchor truth, the
                 extrapolation a 1D allegiance score cannot see (CLAUDE.md)
 
-These are the axes of the six-case taxonomy, so clustering in this space is the
-algorithmic version of sorting the plots by eye. Everything is scaled per
-parameter (R² is already unitless; distances are in units of the parameter's
-test-set spread) so rows are comparable across parameters and pairs.
+These are the axes of the six-case taxonomy, so this table is the input for
+downstream dimensionality reduction / clustering (not run here). Everything is
+scaled per parameter (R² is already unitless; distances are in units of the
+parameter's test-set spread) so rows are comparable across parameters and pairs.
 
 Reads the same cached model outputs the plots use, so calling this alongside
 plotting costs almost nothing extra.
@@ -156,24 +156,45 @@ def pair_features(all_results, r2, param_names, obs1, obs2, space="processed"):
     return pd.DataFrame(f)
 
 
-def rule_based_case(df):
-    """Label each row with the hand taxonomy (CLAUDE.md, cases 1-6) as a
-    baseline to sanity-check clusters against. Thresholds are deliberately
-    crude — this is an anchor for interpretation, not ground truth."""
-    hi, gain_eps = 0.1, 0.05
-    a, b = df["r2_A_clean"], df["r2_B_clean"]
-    both, gain = df["r2_both_clean"], df["gain_from_combining"]
-    a_hi, b_hi, both_hi = a >= hi, b >= hi, both >= hi
-    graceful = (df[["curvature_A", "curvature_B"]].min(axis=1) >= 0)
+# One-line meaning per column (case-specific columns share a prefix), written
+# next to the feature table so downstream analysis doesn't need this file.
+COLUMN_DESCRIPTIONS = {
+    "pair": "observable pair, '<obs1>__<obs2>'",
+    "obs1": "observable_1 (A, alphabetically first)",
+    "obs2": "observable_2 (B)",
+    "param": "parameter name θ0..θ34",
+    "figure": "path of this row's consolidated summary figure, relative to the output dir",
+    "r2_": "aligned test-set R² for the named case",
+    "r2_best_single": "max(R² A alone, R² B alone)",
+    "r2_both_clean": "R² with both observables, no noise",
+    "gain_from_combining": "R²(both clean) - best single-observable R²",
+    "single_asymmetry": "R²(A alone) - R²(B alone)",
+    "both_singles_low": "min(R² A alone, R² B alone)",
+    "degradation_": "R² drop from both-clean to noise 5.0 on that observable (B or A arm)",
+    "curvature_": "R² midpoint (noise 2.5) minus chord; >0 graceful, <0 cliff",
+    "degradation_asymmetry": "degradation_B - degradation_A",
+    "delta_shuffle_obs2": "R²(obs2 shuffled) - R²(aligned), both-clean case; tests reliance on obs1",
+    "delta_shuffle_obs1": "R²(obs1 shuffled) - R²(aligned), both-clean case; tests reliance on obs2",
+    "shuffle_asymmetry": "delta_shuffle_obs2 - delta_shuffle_obs1",
+    "allegiance": "|Δ obs2-shuffled| / (|Δ obs2-shuffled| + |Δ obs1-shuffled|); 1 = relies on obs1",
+    "max_shuffle_drop": "most negative of the two shuffle deltas",
+    "slope_": "slope of predicted vs true for the named case (1 = no shrinkage, 0 = prior mean)",
+    "slope_drop_": "slope at both-clean minus slope at noise 5.0 on that arm",
+    "u_median_": "median normalized chimera position u (0 = kept sim's truth, 1 = swapped sim's)",
+    "u_iqr_": "IQR of u",
+    "frac_tracks_kept_": "fraction of chimeras with |u| < 0.25",
+    "frac_tracks_swapped_": "fraction of chimeras with |u - 1| < 0.25",
+    "offline_dist_": "mean |pred - anchor truth| / test-set std of the parameter",
+}
 
-    label = pd.Series("unclassified", index=df.index)
-    label[~both_hi & ~a_hi & ~b_hi] = "5_unconstrained"
-    label[both_hi & ~a_hi & ~b_hi] = "4_only_combined"
-    one_only = (a_hi ^ b_hi) & both_hi
-    label[one_only & (gain < gain_eps)] = "1_single_no_gain"
-    label[one_only & (gain >= gain_eps)] = "2_single_but_gain"
-    both_ok = a_hi & b_hi & both_hi
-    label[both_ok & (gain >= gain_eps)] = "3_both_and_gain"
-    label[both_ok & (gain < gain_eps) & graceful] = "6_both_redundant"
-    label[both_ok & (gain < gain_eps) & ~graceful] = "4_only_combined"
-    return label
+
+def describe_columns(columns):
+    """(column, description) table, matching exact names first, then prefixes."""
+    rows = []
+    prefixes = sorted((k for k in COLUMN_DESCRIPTIONS if k.endswith("_")), key=len, reverse=True)
+    for c in columns:
+        desc = COLUMN_DESCRIPTIONS.get(c)
+        if desc is None:
+            desc = next((COLUMN_DESCRIPTIONS[p] for p in prefixes if c.startswith(p)), "")
+        rows.append({"column": c, "description": desc})
+    return pd.DataFrame(rows)

@@ -9,11 +9,12 @@ question.
 **Repo**: `camelsPE/` (git). Branch: `hpc-sweep` — a stripped-down HPC
 version. Notebooks, the moment network, heteroscedastic and SBI code live on
 `moment-network`.
-**Entry point**: `run_sweep.py` — one continuous script with four stages:
-`train` (every observable pair) -> `features` (a vector per pair×parameter)
--> `plots` (consolidated summary for all 35 parameters) -> `cluster` (embed
-and group the feature space). `run_sweep.sh` is the SLURM wrapper, with
-`--array` sharding.
+**Entry point**: `run_sweep.py` — one continuous run that, for every
+observable pair, trains the models, extracts a feature vector per
+(pair, parameter), and writes the consolidated summary for all 35 parameters.
+`run_sweep.sh` is the SLURM wrapper. **Scope is training, features and plots
+only**; dimensionality reduction and clustering are downstream and do not
+belong in this repo.
 
 **Module wiring**: `run_sweep.py` is the driver; the machinery lives in
 `src/pipeline.py` (data/loader/prediction utilities) and `src/plots.py` (the
@@ -202,40 +203,52 @@ GAL_SBI/
 │   └── data_L50_TNG_v3.hdf5    ← training data (default --data path)
 └── camelsPE/                    ← git repo (remote is YongseokJo/camelsPE)
     ├── CLAUDE.md
-    ├── run_sweep.py        ← THE script: train → features → plots → cluster
-    ├── cluster_params.py   embedding + clustering stage (also standalone)
-    ├── run_sweep.sh        SLURM wrapper (resubmit to resume; --array shards)
+    ├── run_sweep.py        ← THE script: train → features → plots, all pairs
+    ├── run_sweep.sh        SLURM wrapper (resubmit to resume)
     ├── src/
     │   ├── models.py       SimpleMLP
     │   ├── train.py        fit_with_epoch_noise — device-resident loop
     │   ├── pipeline.py     normalize, eval loaders, resolve_shuffle,
     │   │                   get_case_predictions, average_r2_over_perms
-    │   ├── features.py     per-(pair, parameter) feature vectors
+    │   ├── features.py     per-(pair, parameter) feature vectors + column dictionary
     │   └── plots.py        the consolidated-summary panels
-    └── sweep_output/       (gitignored) models/ tables/ features/ plots/ clusters/
+    └── sweep_output/       (gitignored) see "Outputs" below
 ```
 
 ## Running
 
 - Everything: `python run_sweep.py` (or `sbatch run_sweep.sh`). 14
-  observables → 91 pairs × 7 cases × 1500 epochs, then 35 summary figures
-  per pair.
-- Resumable: pairs with `sweep_output/models/<pair>.pt` are skipped;
-  `--overwrite` retrains. `--stages train,features` etc. runs a subset;
-  `--shard I/N` splits pairs across a SLURM array.
+  observables → 91 pairs × 7 cases × 1500 epochs, then features and 35
+  summary figures per pair.
+- Resumable: pairs with `sweep_output/models/<pair>.pt` are loaded instead of
+  retrained (features and plots are regenerated); `--overwrite` retrains.
 - Smoke test: `python run_sweep.py --epochs 5 --pairs 0 --out /tmp/smoke`.
-- Rough cost: plotting is ~40 s per pair (~1 h total) and ~18 MB per pair
-  (~1.6 GB total); training dominates wall-clock.
+- Rough cost: features + plots are ~40 s per pair (~1 h total) and ~18 MB
+  per pair (~1.6 GB total); training dominates wall-clock.
 
-## Downstream goal: clustering the parameter behavior
+## Outputs — set up for downstream analysis
 
-The point of sweeping every pair is to categorize (pair, parameter)
-combinations **algorithmically** instead of by eye. The plots are kept for
-human verification, but the clustering runs on feature vectors, not images —
-a CNN over rendered PNGs would encode axis limits and point density and give
-no interpretable reason for a grouping.
+```
+sweep_output/
+├── models/<pair>.pt        weights per noise case, losses, R² matrices, hparams
+├── tables/<pair>/*.csv     aligned + shuffled R², long-format dual table
+├── features/<pair>.csv     35 rows (one per parameter)
+├── plots/<pair>/           R² heatmaps, loss curves, θ<j>_summary.png × 35
+├── plots/summary/          cross-pair heatmaps
+├── features_all.csv        all 91 × 35 rows + `figure` path to each summary
+├── feature_columns.csv     one-line meaning of every column
+└── run_config.json         hyperparameters, data file, git commit, failures, timing
+```
 
-`src/features.py` turns each consolidated summary into ~41 numbers:
+`features_all.csv` is the entry point for downstream dimensionality
+reduction / clustering: one row per (pair, parameter), identity columns
+(`pair`, `obs1`, `obs2`, `param`, `figure`) followed by ~41 numeric features.
+The `figure` column maps any downstream result (a cluster, an outlier) back to
+the plot that shows it.
+
+The features are the numeric content of each consolidated summary, so
+downstream work can run on numbers rather than images (a model over rendered
+PNGs would mostly encode axis limits and point density):
 
 | Panel | Features |
 |---|---|
@@ -244,16 +257,9 @@ no interpretable reason for a grouping.
 | shuffle scatters | where chimera predictions land between kept and swapped truth: median, IQR, fraction tracking each side, allegiance |
 | pair-truth scatters | off-line distance from the anchor truth — the chimera extrapolation a 1D allegiance score misses |
 
-`cluster_params.py` then z-scores, runs PCA, embeds (UMAP if installed, else
-t-SNE), and clusters (HDBSCAN if installed, else KMeans with k chosen by
-silhouette). It writes cluster labels per (pair, parameter), a cluster-profile
-heatmap saying what defines each group, a cross-tab against
-`features.rule_based_case` (the six-case rules as a crude anchor), and copies
-each cluster's medoid figures into `clusters/medoids/` so a cluster can be
-named by looking at the plots it contains.
-
-Both fall back gracefully when UMAP/HDBSCAN are missing, so the stage never
-blocks an HPC run.
+Case-specific columns are named after the case (`r2_B_2.5_A_0.0`,
+`slope_A_clean`), and the case keys are identical for every pair, so columns
+line up across all rows.
 
 ## Code style
 
@@ -287,10 +293,9 @@ Recording these to prevent future sessions from re-flagging them:
   dominated by the tail.
 - **Feature set is a first pass**: the vectors cover the four panel types
   but nothing about per-parameter posterior width (that would need the
-  moment network from `moment-network`).
-- **Cluster count is data-driven, not validated**: silhouette picks k, and
-  the rule-based cross-tab is a sanity anchor, not ground truth. Hand-label
-  a sample of medoids to check the grouping means what you think.
+  moment network from `moment-network`). Some columns are strongly
+  correlated (e.g. per-case R² and slopes); expect to standardize and
+  reduce before clustering downstream.
 - **Short-name collisions in scatter plots**: `plots.py`'s `short_of` uses
   the first token of the observable name, so same-quantity pairs (e.g.
   `MBH_Mh_s61 × MBH_Mh_s90`) are both labeled "MBH" in the shuffle and

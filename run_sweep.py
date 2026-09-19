@@ -1,29 +1,30 @@
-"""Full observable-pair sweep: train, save, plot, featurize, cluster.
+"""Full observable-pair sweep in one continuous run: train, featurize, plot.
 
 For every unordered pair of observables in the HDF5 file (14 observables ->
 91 pairs), train one SimpleMLP per noise case (7 cases, see noise_cases_for),
-compute aligned + shuffle-test R², save the models, write the consolidated
-summary figure for every parameter, and extract a feature vector per
-(pair, parameter). The final stage embeds and clusters those vectors, which is
-the algorithmic version of sorting the plots into the six-case taxonomy by
-hand (see CLAUDE.md).
+compute aligned + shuffle-test R², save the models, extract a feature vector
+per (pair, parameter), and write the consolidated summary figure for every
+parameter. The run ends by collecting everything into analysis-ready tables.
 
-    python run_sweep.py                          # everything, all 91 pairs
-    python run_sweep.py --shard 0/8              # one slice (SLURM array)
-    python run_sweep.py --stages cluster         # re-cluster from saved features
-    python run_sweep.py --epochs 5 --pairs 0     # smoke test
+    python run_sweep.py                        # all 91 pairs
+    python run_sweep.py --epochs 5 --pairs 0   # smoke test
 
-Resumable: a pair whose models/<pair>.pt exists is not retrained (--overwrite
-forces). Stages run in order train -> features -> plots -> cluster; pick a
-subset with --stages.
+Resumable: a pair whose models/<pair>.pt exists is loaded instead of retrained
+(features and plots are regenerated), so resubmitting a timed-out job
+continues into the same output. --overwrite forces retraining.
 
 Output layout (--out, default ./sweep_output):
     models/<pair>.pt            state_dicts, losses, noise cases, R² matrices
     tables/<pair>/*.csv         aligned / shuffled R², long-format dual table
-    features/<pair>.csv         one row per parameter (see src/features.py)
+    features/<pair>.csv         one feature row per parameter (src/features.py)
     plots/<pair>/*.png          heatmaps, loss curves, per-parameter summaries
     plots/summary/*.png         cross-pair heatmaps
-    clusters/                   embedding, cluster labels, cluster profiles
+    features_all.csv            every (pair, parameter) row + path to its figure
+    feature_columns.csv         one-line meaning of every feature column
+    run_config.json             hyperparameters, data file, git commit, timing
+
+Downstream (dimensionality reduction, clustering) starts from
+features_all.csv and is not run here.
 
 Design notes (see CLAUDE.md): noise is added to the normalized observable and
 NOT renormalized; noise is resampled every epoch; val/test inputs are clean.
@@ -32,7 +33,9 @@ Case names use A = observable_1 (alphabetically first), B = observable_2.
 import os
 import sys
 import time
+import json
 import argparse
+import subprocess
 import textwrap
 import contextlib
 from itertools import combinations
@@ -67,7 +70,6 @@ LOGFLAG_MASK = np.array([False, False, True, True, True, True, False, False, Fal
                          False, True])
 N_SIMS = 1024
 N_SHUFFLE_PERMS = 10
-STAGES = ("train", "features", "plots", "cluster")
 
 
 def noise_cases_for(obs1, obs2):
@@ -401,7 +403,7 @@ def plot_pair(D, obs1, obs2, noise_cases, all_results, r2, dual, pdir, params):
             f"ΔR², {obs1} shuffled  |  {tag}",
             os.path.join(pdir, "05_delta_r2_shuffled_obs1.png"), **kw)
 
-    # Consolidated summary per parameter — the figures clusters are read against
+    # Consolidated summary per parameter — one figure per row of features/<pair>.csv
     for p in params:
         try:
             consolidated_summary(dual, p)
@@ -486,12 +488,8 @@ def parse_args(argv=None):
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--data", default=os.path.join(HERE, "..", "DATA", "data_L50_TNG_v3.hdf5"))
     ap.add_argument("--out", default=os.path.join(HERE, "sweep_output"))
-    ap.add_argument("--stages", default="all",
-                    help=f"comma-separated subset of {','.join(STAGES)} (default: all)")
     ap.add_argument("--pairs", type=int, nargs="*", default=None,
                     help="pair indices to run (default: all); printed at startup")
-    ap.add_argument("--shard", default=None, metavar="I/N",
-                    help="run pair slice I of N, for SLURM array jobs (0-based I)")
     ap.add_argument("--epochs", type=int, default=1500)
     ap.add_argument("--batch-size", type=int, default=64)
     ap.add_argument("--eval-batch-size", type=int, default=4096,
@@ -510,13 +508,38 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+def git_commit():
+    try:
+        return subprocess.run(["git", "-C", HERE, "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def collect_features(out, pair_list, param_names):
+    """Stack every pair's feature CSV into one analysis-ready table, with the
+    path of each row's summary figure so downstream results map back to plots."""
+    frames = []
+    for obs1, obs2 in pair_list:
+        path = os.path.join(out, "features", f"{obs1}__{obs2}.csv")
+        if os.path.exists(path):
+            frames.append(pd.read_csv(path))
+    if not frames:
+        print("[features] no feature files found")
+        return
+    df = pd.concat(frames, ignore_index=True)
+    df.insert(4, "figure", [os.path.join("plots", pr, f"{pa}_summary.png")
+                            for pr, pa in zip(df["pair"], df["param"])])
+    df.to_csv(os.path.join(out, "features_all.csv"), index=False)
+    features_mod.describe_columns(df.columns).to_csv(
+        os.path.join(out, "feature_columns.csv"), index=False)
+    n_feat = df.select_dtypes(include=[np.number]).shape[1]
+    print(f"[features] features_all.csv: {len(df)} rows "
+          f"({df['pair'].nunique()} pairs × {len(param_names)} params), {n_feat} numeric features")
+
+
 def main(argv=None):
     args = parse_args(argv)
-    stages = STAGES if args.stages == "all" else tuple(s.strip() for s in args.stages.split(","))
-    bad = set(stages) - set(STAGES)
-    if bad:
-        raise SystemExit(f"unknown stage(s) {sorted(bad)}; pick from {STAGES}")
-
     threads = args.threads or int(os.environ.get("SLURM_CPUS_PER_TASK", 0)) or None
     if threads:
         torch.set_num_threads(threads)
@@ -533,21 +556,14 @@ def main(argv=None):
 
     all_pairs = list(combinations(sorted(x_raw), 2))   # sorted -> (obs1, obs2)
     todo = all_pairs if args.pairs is None else [all_pairs[i] for i in args.pairs]
-    if args.shard:
-        i, n = (int(v) for v in args.shard.split("/"))
-        todo = todo[i::n]
     print(f"device={device}  threads={threads or 'default'}  sims={len(y)}  "
           f"train/val/test={len(idx_train)}/{len(idx_val)}/{len(idx_test)}")
-    print(f"{len(x_raw)} observables -> {len(all_pairs)} pairs; running {len(todo)}; "
-          f"stages={','.join(stages)}")
+    print(f"{len(x_raw)} observables -> {len(all_pairs)} pairs; running {len(todo)}")
     for sub in ("models", "tables", "features", "plots"):
         os.makedirs(os.path.join(args.out, sub), exist_ok=True)
 
     failed = []
-    pair_stages = [s for s in stages if s != "cluster"]
     for n_i, (obs1, obs2) in enumerate(todo, 1):
-        if not pair_stages:
-            break
         pair = f"{obs1}__{obs2}"
         mpath = os.path.join(args.out, "models", pair + ".pt")
         t0 = time.time()
@@ -560,9 +576,6 @@ def main(argv=None):
                 noise_cases, r2 = saved["noise_cases"], saved["r2"]
                 configure_modules(D, obs1, obs2, noise_cases, all_results, r2)
                 print("    loaded saved models (--overwrite to retrain)")
-            elif "train" not in stages:
-                print("    no saved models and train stage is off, skipping")
-                continue
             else:
                 configure_modules(D, obs1, obs2, noise_cases)
                 all_results = train_pair(D, noise_cases)
@@ -576,16 +589,13 @@ def main(argv=None):
                                 list(noise_cases), D["param_names"], r2)
 
             # features before plots: it warms the chimera-grid cache the plots reuse
-            if "features" in stages:
-                feats = features_mod.pair_features(all_results, r2, D["param_names"], obs1, obs2)
-                feats.to_csv(os.path.join(args.out, "features", pair + ".csv"), index=False)
-                print(f"    features: {feats.shape[0]} params × {feats.shape[1] - 4} columns")
+            feats = features_mod.pair_features(all_results, r2, D["param_names"], obs1, obs2)
+            feats.to_csv(os.path.join(args.out, "features", pair + ".csv"), index=False)
 
-            if "plots" in stages:
-                plot_pair(D, obs1, obs2, noise_cases, all_results, r2, dual,
-                          os.path.join(args.out, "plots", pair), D["param_names"])
-                print(f"    plotted {len(D['param_names'])} parameter summaries")
-            print(f"    pair done in {(time.time()-t0)/60:.1f} min", flush=True)
+            plot_pair(D, obs1, obs2, noise_cases, all_results, r2, dual,
+                      os.path.join(args.out, "plots", pair), D["param_names"])
+            print(f"    features + {len(D['param_names'])} summaries in "
+                  f"{(time.time()-t0)/60:.1f} min total", flush=True)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -593,12 +603,17 @@ def main(argv=None):
             plt.close("all")
             print(f"    [FAIL] {pair}: {type(e).__name__}: {e}", flush=True)
 
-    if "plots" in stages and not args.shard:
-        plot_summary(D, all_pairs, args.out)
-    if "cluster" in stages and not args.shard:
-        import cluster_params
-        cluster_params.run(args.out)
-    print(f"\nFinished in {(time.time()-t_start)/3600:.2f} h. Failed pairs: {failed or 'none'}")
+    plot_summary(D, all_pairs, args.out)
+    collect_features(args.out, all_pairs, D["param_names"])
+
+    hours = (time.time() - t_start) / 3600
+    with open(os.path.join(args.out, "run_config.json"), "w") as f:
+        json.dump({**{k: v for k, v in vars(args).items()},
+                   "git_commit": git_commit(), "device": str(device),
+                   "n_pairs": len(all_pairs), "pairs_run": len(todo),
+                   "failed_pairs": failed, "hours": round(hours, 3),
+                   "finished": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=2)
+    print(f"\nFinished in {hours:.2f} h. Failed pairs: {failed or 'none'}")
     return 1 if failed else 0
 
 
