@@ -10,7 +10,7 @@
 #   kernelspec:
 #     display_name: py311-main
 #     language: python
-#     name: python3
+#     name: py311-main
 # ---
 
 # %% [markdown]

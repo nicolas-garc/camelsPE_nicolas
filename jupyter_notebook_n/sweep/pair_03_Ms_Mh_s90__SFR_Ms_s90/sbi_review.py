@@ -10,7 +10,7 @@
 #   kernelspec:
 #     display_name: py311-main
 #     language: python
-#     name: python3
+#     name: py311-main
 # ---
 
 # %% [markdown]
@@ -205,10 +205,24 @@ if both_clean is not None:
     shuffle_df = pd.DataFrame(_rows)
     print(shuffle_df.pivot(index="param", columns="mode", values="r2"))
 
+# %% [markdown]
+# ## 9. Individual vs combined posteriors under the shuffle test
+#
+# Same comparison as section 6 (observable_1 alone, observable_2 alone, both
+# combined -- one test sim, one corner plot) but now for the two shuffle
+# modes instead of aligned. Under obs1_vs_truth, observable_2 gets shuffled:
+# the observable_2-alone posterior should collapse (its only input is now
+# garbage) while observable_1-alone stays put (unaffected, its input wasn't
+# touched) -- the combined posterior's behavior in between is the interesting
+# part, since it shows how much the model still leans on the one clean channel.
+# obs2_vs_truth is the mirror image.
+
 # %%
 if both_clean is not None:
-    MULTI_SIM_IDX = [0, 25, 50, 75, 101]
-    for _mode in ["aligned", "obs1_vs_truth", "obs2_vs_truth"]:
-        fig = sbi_pl.plot_sbi_multi_sim_corner(both_clean, MULTI_SIM_IDX, n_samples=1500,
-                                                space="log_partial", mode=_mode)
+    _shuffle_cases = [r for r in sbi_ctx.all_results if r["case_name"] in ("A_clean", "B_clean", "B_0.0_A_0.0")]
+    _shuffle_labels = [sbi_ctx.display_names.get(r["case_name"], r["case_name"]) for r in _shuffle_cases]
+    for _mode in ["obs1_vs_truth", "obs2_vs_truth"]:
+        fig = sbi_pl.plot_sbi_case_overlay_corner(_shuffle_cases, SIM_IDX, n_samples=N_SAMPLES_CORNER,
+                                                   space="log_partial", case_labels=_shuffle_labels,
+                                                   mode=_mode)
         plt.show()

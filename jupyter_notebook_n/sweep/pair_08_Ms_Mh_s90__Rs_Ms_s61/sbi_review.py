@@ -14,7 +14,7 @@
 # ---
 
 # %% [markdown]
-# # SBI review + focus-param checkpoint -- MBH_Mh_s61 x SFR_Ms_s90
+# # SBI review + focus-param checkpoint -- Ms_Mh_s90 x Rs_Ms_s61
 #
 # Manual-checkpoint workflow (see CLAUDE.md, "The shuffle test" section, for
 # the mean-net version of the same idea):
@@ -49,7 +49,7 @@ import sbi_pipeline as sbi_pl
 # ## 1. Load noise-sweep results (mean net, all 35 params, 7 cases)
 
 # %%
-ctx = load_pair(pair_dir="pair_01_MBH_Mh_s61__SFR_Ms_s90")
+ctx = load_pair(pair_dir="pair_08_Ms_Mh_s90__Rs_Ms_s61")
 ctx.summary()
 
 # %% [markdown]
