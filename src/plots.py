@@ -664,7 +664,7 @@ def plot_param_lines_min(
             selected_observables=res["selected_observables"],
             x_dict=x_normalized_dict,
             y_vector=y,
-            idx=idx_val,
+            idx=_eval_idx(),
             batch_size=batch_size,
             key_to_shuffle=skeys,
             perm=_perm if skeys is not None else None,
@@ -1006,10 +1006,13 @@ def plot_param_pair_normalized_values(
     # choose which truth is sim1 (0) and sim2 (1)
     normalize_endpoints="obs1_to_obs2",  # "obs1_to_obs2" or "obs2_to_obs1"
 
-    # NEW: choose space for normalization/plotting
-    # "physical": exp() logflag params (current behavior)
-    # "log": keep log-space values (no exp)
-    space="physical",
+    # choose space for normalization/plotting: "processed" (default, the
+    # model's own training space -- mean 0/std 1), "log" (processed
+    # un-standardized; gives the SAME p_norm ratio as "processed" since
+    # standardization is affine and cancels out of a ratio-of-differences,
+    # so this only exists for callers who want log-space axis units), or
+    # "physical" (exp() applied to logflag params too).
+    space="processed",
 
     # NEW: make obs1/obs2 definition explicit
     # "sorted" -> obs1/obs2 are the first/second keys in sorted(selected_observables.keys())
@@ -1066,8 +1069,11 @@ def plot_param_pair_normalized_values(
     Pair-normalized value:
         p_norm(case, j) = (pred(case,j) - t0(j)) / (t1(j) - t0(j))
 
-    The 'space' argument controls whether the above is computed in physical space (exp applied)
-    or log space (no exp).
+    The 'space' argument controls which space pred/t0/t1 are computed in:
+    "processed" (default, model's training space), "log", or "physical"
+    (exp applied to logflag params). "processed" and "log" give the same
+    p_norm ratio (standardization cancels out of it); "physical" differs
+    for logflag parameters.
     """
     if results is None: results = all_results
     if x_dict is None: x_dict = x_normalized_dict
@@ -3670,6 +3676,7 @@ def plot_prediction_attractor_map(param,
                                     *,
                                     case_sequence=None,
                                     obs_pair=None,
+                                    space="processed",
                                     results=None,
                                     param_labels=None,
                                     n_bins=15,
@@ -3695,6 +3702,17 @@ def plot_prediction_attractor_map(param,
         no info.  Every real case's line sits between these two extremes;
         vertical position at each true-θ tells you how much predictions are
         being pulled toward the mean at that part of the parameter range.
+
+    space: "processed" (default) bins/averages in the model's own training
+    space (mean 0, std 1) -- every parameter is uniformly distributed there
+    (see the parameter_distributions notebook), so bins stay evenly
+    populated regardless of whether this parameter is logflagged, and
+    y = mean(true) collapses to the trivial y = 0 line. "log" or "physical"
+    bin/average in those spaces instead -- physical space in particular
+    reintroduces the skew that motivated switching to "processed": bins are
+    equal-WIDTH, not equal-count, so a long-tailed logflagged parameter
+    packs most sims into a few low bins and leaves the tail sparse (bins
+    under min_per_bin silently drop out as gaps in the curve).
 
     Cases are colored along dual_clean_asym_order with coolwarm; the
     reference case (auto-detected as the both-clean combo, or passed
@@ -3806,7 +3824,7 @@ def plot_prediction_attractor_map(param,
     per_case = {}
     true_ref = None
     for c in case_sequence:
-        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm)
+        preds, trues = get_case_predictions(case_to_result[c], mode="aligned", perm=perm, space=space)
         yp = preds[:, p_idx]; yt = trues[:, p_idx]
         if true_ref is None:
             true_ref = yt
@@ -3905,17 +3923,15 @@ def plot_prediction_attractor_map(param,
                 label=lab, zorder=5)
 
     ax.set_xlim(lo, hi)
-    ax.set_xlabel(f"True {p_label} (physical space)")
+    ax.set_xlabel(f"True {p_label} ({space} space)")
     ax.set_ylabel(f"Mean predicted {p_label} per bin")
     ax.grid(alpha=0.25)
     ax.legend(fontsize=8, loc="best", framealpha=0.9)
 
+    # "collapsed into one view" and the line-color/ordering explainer dropped
+    # -- the legend already names each case, that was just clutter.
     pair_str = f"{obs_pair[0]} ↔ {obs_pair[1]}" if obs_pair else "unknown pair"
-    ax.set_title(
-        f"Attractor map for {p_label} — {n_cases} noise cases collapsed into one view\n"
-        f"observables: {pair_str}   |   line color = case position in dual-clean-asym order",
-        fontsize=11
-    )
+    ax.set_title(f"Attractor map — {p_label}   |   {pair_str}", fontsize=11)
 
     annot_lines = ["closer to y=x → less shrinkage (more info)",
                    "closer to horizontal mean line → more shrinkage (less info)",
@@ -4205,27 +4221,36 @@ def plot_per_sim_accuracy_heatmap(param,
     return fig, stats
 
 
-def _compute_all_chimera_preds(result, mode, x_dict, idx_val_, p_idx, batch_size, device_):
+def _compute_all_chimera_preds(result, mode, x_dict, eval_idx_, p_idx, batch_size, device_, space="physical"):
     """All chimera predictions for one case + one parameter.
 
     Returns a (n_val, n_val) matrix where entry [j, k] is the model's
-    prediction (in physical space, matching get_case_predictions) when the
-    input uses:
+    prediction (in the requested space, matching get_case_predictions) when
+    the input uses:
       - row j's KEPT observable(s), and
       - row k's SHUFFLED observable(s)
 
+    space: "processed" (raw model output), "log" (processed un-standardized),
+    or "physical" (log undone too, via exp() when this parameter is
+    logflagged) -- same convention and same module-level stds/means/logflag
+    as get_case_predictions.
+
     j == k rows are still computed; the caller filters them if unwanted.
     Column layout in the model input matches the loader: features are
-    concatenated in sorted(selected_observables.keys()) order. Uses the
-    module-level stds/means/logflag to convert to physical space so this
-    matches get_case_predictions bit-for-bit at j == k (aligned rows).
+    concatenated in sorted(selected_observables.keys()) order. Space
+    conversion here matches get_case_predictions bit-for-bit at j == k
+    (aligned rows) -- PROVIDED the caller passes the same evaluation indices
+    get_case_predictions uses internally (_eval_idx(), i.e. idx_test if
+    configured else idx_val). Passing plain idx_val when idx_test is a
+    different, disjoint set silently pairs each row against the wrong
+    simulation's truth everywhere downstream.
     """
     selected = result["selected_observables"]
     sel_keys_sorted = sorted(selected.keys())
     shuffle_keys, _ = resolve_shuffle(selected, mode)
     shuffle_set = set(shuffle_keys)
 
-    idx_arr = np.asarray(idx_val_)
+    idx_arr = np.asarray(eval_idx_)
     n = len(idx_arr)
 
     # For each observable in sorted order, build (n*n, feat_dim) with the
@@ -4249,19 +4274,25 @@ def _compute_all_chimera_preds(result, mode, x_dict, idx_val_, p_idx, batch_size
             outs.append(model(x_all[i:i + batch_size].to(device_)).cpu())
     preds_flat = torch.cat(outs, dim=0).numpy()
 
-    pred_p = preds_flat[:, p_idx] * stds[p_idx] + means[p_idx]
-    if logflag[p_idx]:
-        pred_p = np.exp(pred_p)
+    pred_p = preds_flat[:, p_idx]
+    if space != "processed":
+        pred_p = pred_p * stds[p_idx] + means[p_idx]
+        if space == "physical":
+            if logflag[p_idx]:
+                pred_p = np.exp(pred_p)
+        elif space != "log":
+            raise ValueError("space must be 'processed', 'log', or 'physical'.")
     return pred_p.reshape(n, n)
 
 
 def plot_pair_normalized_shuffle_scatter(param,
                                             *,
                                             case=None,
+                                            space="processed",
                                             mode="obs1_vs_truth",
                                             x_pred_source="aligned",
                                             obs_pair=None,
-                                            normalize_endpoints="obs1_to_obs2",
+                                            normalize_endpoints="anchor_to_partner",
                                             n_pairs=None,
                                             pair_seed=0,
                                             all_pairs_batch_size=2048,
@@ -4277,8 +4308,9 @@ def plot_pair_normalized_shuffle_scatter(param,
                                             show_unit_lines=True,
                                             marker_alpha=None,
                                             marker_size=None,
-                                            color_by_theta1=False,
-                                            theta1_cmap="viridis",
+                                            color_by_theta_diff=False,
+                                            theta_diff_cmap="RdBu_r",
+                                            theta_diff_clip_quantile=0.98,
                                             figsize=(7.5, 7.5),
                                             save_path=None):
     """
@@ -4314,11 +4346,17 @@ def plot_pair_normalized_shuffle_scatter(param,
     sim_1 is ALWAYS the anchor row j (the sim supplying the kept/unshuffled
     channel) and sim_2 is ALWAYS the partner row perm[j] (supplies the
     shuffled channel) -- this role assignment is independent of `mode`.
-    normalize_endpoints (obs1_to_obs2 by default) picks which role maps to
-    the 0-endpoint: obs1_to_obs2 → anchor→0, partner→1; obs2_to_obs1 → the
-    reverse. `mode` separately decides which OBSERVABLE the anchor/partner
-    roles each supply (see Mode below) -- it does NOT change which physical
-    sim is called sim_1 vs sim_2.
+    normalize_endpoints (anchor_to_partner by default) picks which ROLE maps
+    to the 0-endpoint: anchor_to_partner → anchor→0, partner→1;
+    partner_to_anchor → the reverse. This is deliberately named by ROLE, not
+    by observable: unlike plot_param_pair_normalized_values (where obs1/obs2
+    ARE the sim1/sim2 labels), here `mode` decides which OBSERVABLE the
+    anchor/partner roles each supply, so "the obs1-supplying sim" is the
+    anchor under mode="obs1_vs_truth" but the PARTNER under
+    mode="obs2_vs_truth" -- an "obs1_to_obs2"-style name would silently mean
+    different things depending on `mode`. anchor_to_partner avoids that: it
+    always means anchor→0 regardless of mode, which is also why x (built
+    from the anchor's own prediction) comes out identical for both modes.
 
     Case: `case` defaults to the both-clean combo case for the observable
     pair (auto-detected via parse_case_name).  Only single-case at a time.
@@ -4375,11 +4413,12 @@ def plot_pair_normalized_shuffle_scatter(param,
     marker_alpha / marker_size default to None → auto-scaled from the
     pair count so dense enriched scatters stay legible.
 
-    color_by_theta1: if True, colors each dot by θ_1 (t0_arr, sim_1's true
-    value -- the same truth the x/y normalization is anchored to), mapped
-    with theta1_cmap over the parameter's full val-set true-value range
-    (not just the range of kept pairs), so color is comparable across
-    mode/case calls and across side-by-side panels sharing this axis.
+    color_by_theta_diff: if True, colors each dot by the SIGNED truth
+    difference θ_sim2 − θ_sim1 (t1_arr − t0_arr, i.e. the same pair-distance
+    that normalizes x/y, but signed rather than absolute) using
+    theta_diff_cmap (a diverging map, symmetric about 0) clipped to the
+    theta_diff_clip_quantile of |θ_sim2 − θ_sim1| so a few extreme pairs
+    don't wash out the color scale for the rest.
 
     Degeneracy filter is SCALE-INVARIANT across parameters. A pair is dropped
     if |θ_2 − θ_1| < max(min_pair_distance_frac × range(true), degenerate_eps),
@@ -4484,7 +4523,7 @@ def plot_pair_normalized_shuffle_scatter(param,
         raise ValueError("perm length must match len(_eval_idx()).")
 
     # --- aligned predictions from the shared cache (used regardless of n_pairs) ---
-    preds_a, true_a = get_case_predictions(result, mode="aligned", perm=perm)
+    preds_a, true_a = get_case_predictions(result, mode="aligned", perm=perm, space=space)
     pa = preds_a[:, p_idx]                # θ̂_aligned per anchor row (fixed)
     truth_base = true_a[:, p_idx]         # truth per row
     n_val = len(pa)
@@ -4492,7 +4531,7 @@ def plot_pair_normalized_shuffle_scatter(param,
     # --- build pair arrays (anchors, partners, pred_shuf_per_pair) per n_pairs mode ---
     if n_pairs is None:
         # Single-perm mode (original behaviour). One pair per anchor.
-        preds_s, true_s = get_case_predictions(result, mode=mode, perm=perm)
+        preds_s, true_s = get_case_predictions(result, mode=mode, perm=perm, space=space)
         if not np.allclose(true_a, true_s, rtol=1e-8, atol=1e-8):
             raise ValueError(
                 "aligned vs shuffled truth vectors differ -- get_case_predictions returned "
@@ -4512,14 +4551,14 @@ def plot_pair_normalized_shuffle_scatter(param,
         partners = np.concatenate(perms)
         shuf_chunks = []
         for pk in perms:
-            preds_k, _ = get_case_predictions(result, mode=mode, perm=pk)
+            preds_k, _ = get_case_predictions(result, mode=mode, perm=pk, space=space)
             shuf_chunks.append(preds_k[:, p_idx])
         pred_shuf_arr = np.concatenate(shuf_chunks)
         n_pairs_desc = f"{K} perms × {n_val} rows = {K * n_val}"
     elif isinstance(n_pairs, str) and n_pairs == "all":
         chimera = _compute_all_chimera_preds(
-            result, mode, x_normalized_dict, idx_val, p_idx,
-            batch_size=all_pairs_batch_size, device_=device,
+            result, mode, x_normalized_dict, _eval_idx(), p_idx,
+            batch_size=all_pairs_batch_size, device_=device, space=space,
         )  # (n_val, n_val); [j, k] = pred with anchor j + partner k
         # Unique unordered pairs only (j < k), not both (j,k) and (k,j).
         # Within one mode those two orderings are genuinely different
@@ -4557,19 +4596,21 @@ def plot_pair_normalized_shuffle_scatter(param,
     # sim_1 = the ANCHOR (supplies the kept/unshuffled channel), sim_2 = the
     # PARTNER (supplies the shuffled channel) -- fixed roles, independent of
     # `mode` (mode only decides which observable each role supplies).
-    # normalize_endpoints picks which role maps to the 0-endpoint.
-    if normalize_endpoints == "obs1_to_obs2":
+    # normalize_endpoints picks which ROLE maps to the 0-endpoint (not which
+    # observable -- that's `mode`'s job; see docstring for why these must stay
+    # decoupled).
+    if normalize_endpoints == "anchor_to_partner":
         t0_arr, t1_arr = truth_j, truth_k
         pred_sim1_arr, pred_sim2_arr = pa_arr, pa_partner_arr
         endpoint_desc = (f"sim_1 = anchor, supplies {anchor_obs_key} (→0);  "
                           f"sim_2 = partner, supplies {partner_obs_key} (→1)")
-    elif normalize_endpoints == "obs2_to_obs1":
+    elif normalize_endpoints == "partner_to_anchor":
         t0_arr, t1_arr = truth_k, truth_j
         pred_sim1_arr, pred_sim2_arr = pa_partner_arr, pa_arr
         endpoint_desc = (f"sim_1 = partner, supplies {partner_obs_key} (→0);  "
                           f"sim_2 = anchor, supplies {anchor_obs_key} (→1)")
     else:
-        raise ValueError("normalize_endpoints must be 'obs1_to_obs2' or 'obs2_to_obs1'.")
+        raise ValueError("normalize_endpoints must be 'anchor_to_partner' or 'partner_to_anchor'.")
 
     denom_abs = np.abs(t1_arr - t0_arr)
     # Scale-invariant degeneracy threshold: FRACTION of the parameter's own true-
@@ -4623,53 +4664,77 @@ def plot_pair_normalized_shuffle_scatter(param,
     if show_diagonal:
         lo, hi = clip_range
         ax.plot([lo, hi], [lo, hi], "--", color="#5F5E5A", lw=1.2, alpha=0.6,
-                zorder=1, label="y = x (shuffling had no effect)")
+                zorder=1, label="y = x  →  swap changed nothing")
 
-    if color_by_theta1:
-        theta1_vmin = float(true_a[:, p_idx].min())
-        theta1_vmax = float(true_a[:, p_idx].max())
-        sc = ax.scatter(x, y, s=marker_size, alpha=marker_alpha, c=t0_arr[keep],
-                         cmap=theta1_cmap, vmin=theta1_vmin, vmax=theta1_vmax,
-                         edgecolor="none", zorder=3, label=f"{n_kept} sims")
+    # --- name endpoints/predictions by observable, not generic sim1/sim2 ---
+    # sim1/sim2 mean "whichever sim supplies the 0/1 endpoint" per
+    # normalize_endpoints -- see docstring for how that maps to anchor/partner.
+    # short_of(key) identifies a SIM by the observable that anchors it (e.g.
+    # "Mg" for Mg_Mh_s61) -- theta_Mg below means "this parameter's truth at
+    # the sim supplying Mg", not the Mg observable's own reading.
+    def short_of(obs_key):
+        return obs_key.split("_")[0]
+
+    obs_for_sim1 = anchor_obs_key if normalize_endpoints == "anchor_to_partner" else partner_obs_key
+    obs_for_sim2 = partner_obs_key if normalize_endpoints == "anchor_to_partner" else anchor_obs_key
+    short1, short2 = short_of(obs_for_sim1), short_of(obs_for_sim2)
+    short_anchor, short_partner = short_of(anchor_obs_key), short_of(partner_obs_key)
+
+    if color_by_theta_diff:
+        theta_diff = (t1_arr - t0_arr)[keep]   # signed: θ_{short2} - θ_{short1}
+        vlim = float(np.quantile(np.abs(theta_diff), theta_diff_clip_quantile)) if n_kept else 1.0
+        vlim = max(vlim, 1e-12)
+        sc = ax.scatter(x, y, s=marker_size, alpha=marker_alpha, c=theta_diff,
+                         cmap=theta_diff_cmap, vmin=-vlim, vmax=vlim,
+                         edgecolor="none", zorder=3, label=f"{n_kept} pairs")
         cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(rf"$\theta_1$ true value ({p_label})", fontsize=8)
+        cbar.set_label(f"θ_{short2} − θ_{short1}  ({p_label} truth, signed)", fontsize=8)
     else:
         ax.scatter(x, y, s=marker_size, alpha=marker_alpha, color="#3C3489",
-                   edgecolor="none", zorder=3, label=f"{n_kept} sims")
+                   edgecolor="none", zorder=3, label=f"{n_kept} pairs")
 
     ax.set_xlim(*clip_range)
     ax.set_ylim(*clip_range)
     ax.set_aspect("equal")
     ax.grid(alpha=0.25)
 
-    x_symbol = {"aligned": r"\hat{\theta}_1^{\rm aligned}",
-                "sim1": r"\hat{\theta}_{\rm sim_1}",
-                "sim2": r"\hat{\theta}_{\rm sim_2}"}[x_pred_source]
-    ax.set_xlabel(rf"$({x_symbol} - \theta_1)\ /\ |\theta_2 - \theta_1|$")
-    ax.set_ylabel(r"$(\hat{\theta}_1^{\rm shuffled} - \theta_1)\ /\ |\theta_2 - \theta_1|$")
+    # Explicit equations, spelled out with the same observable-named theta_X
+    # subscripts as the title/colorbar/annotations -- no bare theta_1/theta_2.
+    x_eq = (rf"$x = (\hat\theta_{{\mathrm{{pred}}}} - \theta_{{\mathrm{{{short1}}}}})"
+            rf"\,/\,|\theta_{{\mathrm{{{short2}}}}} - \theta_{{\mathrm{{{short1}}}}}|$")
+    y_eq = (rf"$y = (\hat\theta_{{\mathrm{{shuffled}}}} - \theta_{{\mathrm{{{short1}}}}})"
+            rf"\,/\,|\theta_{{\mathrm{{{short2}}}}} - \theta_{{\mathrm{{{short1}}}}}|$")
 
-    mode_desc = {"obs1_vs_truth": f"shuffle {obs2_key}  (kept: {obs1_key})",
-                 "obs2_vs_truth": f"shuffle {obs1_key}  (kept: {obs2_key})"}[mode]
+    x_desc = {"aligned": f"prediction from {short_anchor}-sim's data",
+              "sim1": f"prediction from {short1}-sim's data",
+              "sim2": f"prediction from {short2}-sim's data"}[x_pred_source]
+    ax.set_xlabel(f"{x_eq}\n{x_desc}\n(0 = θ_{short1} truth, 1 = θ_{short2} truth)", fontsize=9)
+    ax.set_ylabel(f"{y_eq}\nprediction with {short_partner} swapped\n"
+                  f"(0 = θ_{short1} truth, 1 = θ_{short2} truth)", fontsize=9)
+
+    # Endpoint mapping (0=.../1=...) deliberately left off the title -- it's
+    # already on both axis labels, repeating it here was just clutter.
     ax.set_title(
-        f"Pair-normalized aligned vs shuffled residuals — {p_label}\n"
-        f"case: {case}   |   mode: {mode} ({mode_desc})   |   pairs: {n_pairs_desc}\n"
-        f"{endpoint_desc}",
-        fontsize=10
-    )
-    ax.legend(fontsize=8, loc="best", framealpha=0.9)
+        f"{p_label}  —  shuffle test: keep {short_anchor}, swap in {short_partner}"
+        f"   |   case: {case}   |   n={n_kept}",
+        fontsize=9.5)
+    # Pinned bottom-right (not "best"): the annotation box below is hardcoded
+    # top-left, and "best" occasionally also picks top-left when that corner
+    # is data-sparse, colliding with it.
+    ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
 
-    annot_lines = [
-        "each dot = one (anchor sim, partner sim) chimera",
-        f"x_pred_source={x_pred_source!r}: same anchor → same x only if this "
-        "resolves to the anchor's own prediction (see docstring)",
-        "on y=x → shuffling didn't move the prediction",
-        "y > x → shuffled pred is higher than the x-axis pred",
-        "y = ±1 → shuffled pred is one |θ_2−θ_1| off sim_1's truth",
-    ]
+    # Kept minimal on purpose: the diagonal's own legend entry already covers
+    # "y=x -> no effect"; only show caveats that apply to this specific call.
+    annot_lines = [f"y = ±1  →  θ_shuffled matches θ_{short2} truth"]
+    if x_pred_source != "aligned":
+        annot_lines.append(
+            f"x_pred_source={x_pred_source!r}: same-anchor x only repeats if "
+            "this resolves to the anchor's own prediction (see docstring)"
+        )
     if drop_degenerate_pairs and n_dropped:
         annot_lines.append(
             f"dropped {n_dropped}/{n_total} degenerate pairs "
-            f"(|θ_2−θ_1| ≤ {threshold:.3g}, i.e. {min_pair_distance_frac*100:g}% of {p_label}'s range)"
+            f"(|θ_{short2}−θ_{short1}| ≤ {threshold:.3g}, i.e. {min_pair_distance_frac*100:g}% of {p_label}'s range)"
         )
     ax.text(0.02, 0.98, "\n".join(annot_lines), transform=ax.transAxes,
             va="top", ha="left", fontsize=8, color="#3C3489",
@@ -4687,6 +4752,8 @@ def plot_pair_normalized_shuffle_scatter(param,
         "obs_pair": obs_pair,
         "normalize_endpoints": normalize_endpoints,
         "n_pairs": n_pairs,
+        "n_pairs_desc": n_pairs_desc,
+        "endpoint_desc": endpoint_desc,
         "n_val": n_val,
         "n_total_pairs": n_total,
         "n_kept": n_kept,
@@ -4701,6 +4768,326 @@ def plot_pair_normalized_shuffle_scatter(param,
         "pred_aligned":  pa_arr[keep],
         "pred_x_source": pred_for_x[keep],
         "pred_shuffled": pred_shuf_arr[keep],
+    }
+    return fig, stats
+
+
+def plot_param_pair_truth_scatter(param,
+                                    *,
+                                    anchor_obs="obs1",
+                                    obs1_key=None,
+                                    obs2_key=None,
+                                    case=None,
+                                    space="physical",
+                                    n_pairs="all",
+                                    pair_seed=0,
+                                    all_pairs_batch_size=4096,
+                                    diff_cmap="RdBu_r",
+                                    diff_clip_quantile=0.98,
+                                    marker_alpha=None,
+                                    marker_size=None,
+                                    star_size = 20,
+                                    show_diagonal_line=True,
+                                    show_aligned_points=True,
+                                    results=None,
+                                    x_dict=None,
+                                    y_vector=None,
+                                    idx=None,
+                                    batch_size=None,
+                                    param_labels=None,
+                                    device=None,
+                                    figsize=(7.5, 7.0),
+                                    save_path=None):
+    """
+    Chimera predictions vs. the anchor sim's truth, over every unique pair
+    of validation simulations.
+
+    anchor_obs picks WHICH observable the anchor (x-axis) sim keeps intact:
+      - "obs1" (default): anchor keeps obs1_key, partner supplies obs2_key.
+      - "obs2": anchor keeps obs2_key, partner supplies obs1_key.
+    Call this function twice (once per anchor_obs) to see both directions
+    for one parameter -- side_by_side_pair_truth_scatter in the analysis
+    notebooks does exactly that. Same anchor/partner-role vocabulary as
+    plot_pair_normalized_shuffle_scatter: "anchor" is always the smaller-
+    index validation sim in an unordered pair {i, j} (i < j); "partner" is
+    the other one. anchor_obs only decides which observable each supplies.
+
+    For unordered pair {i, j} (i < j, same convention as
+    sample_unique_unordered_pairs / make_pair_val_loader_fn):
+        x = θ_anchor        (anchor sim's true value)
+        y = model prediction on the chimera input (anchor keeps anchor_obs,
+            partner supplies the other observable)
+        color = θ_partner − θ_anchor   (signed — NOT |θ_partner − θ_anchor|)
+    The aligned pair (i, i) — obs1 AND obs2 both from the same sim, i.e. the
+    model's ordinary own prediction — is included too (same for both
+    anchor_obs values) and drawn as a marker; it always has color 0 by
+    construction (θ_i − θ_i = 0).
+
+    y = x is the reference: predictions that land exactly on the anchor's
+    truth.
+
+    n_pairs: "all" (default) computes every i<j pair via one batched n×n
+    forward pass (n = eval-set size, ~100 here, so n² is cheap) and plots
+    all C(n,2) of them. An int instead randomly subsamples that many
+    off-diagonal pairs (seeded by pair_seed) for a lighter-weight plot; the
+    n×n forward pass still runs once since it's needed to know the diagonal
+    (and is shared/cached across both anchor_obs calls).
+
+    Case: `case` defaults to the both-clean combo case for the observable
+    pair (auto-detected via parse_case_name), same convention as
+    plot_pair_normalized_shuffle_scatter.
+
+    Chimera caveat: off-diagonal points feed the model observables from two
+    different simulations — no such galaxy exists in the training
+    distribution. This is a saliency probe ("which channel does the output
+    track?"), not posterior inference — see the chimera caveat in CLAUDE.md.
+
+    Returns (fig, stats).
+    """
+    if results is None: results = all_results
+    if x_dict is None: x_dict = x_normalized_dict
+    if y_vector is None: y_vector = y
+    if idx is None: idx = _eval_idx()
+    if batch_size is None: batch_size = _cfg["batch_size"]
+    if device is None: device = _cfg["device"]
+    if obs1_key is None: obs1_key = observable_1
+    if obs2_key is None: obs2_key = observable_2
+    if not results:
+        raise ValueError("`results` is empty; train models and populate all_results first.")
+
+    # --- resolve parameter (mirrors sibling functions) ---
+    default_labels = param_labels or _cfg.get("param_names") or [f"θ{i}" for i in range(output_dim)]
+    label_to_idx = {label: i for i, label in enumerate(default_labels)}
+    if isinstance(param, int):
+        if not 0 <= param < output_dim:
+            raise ValueError(f"Parameter index {param} out of range.")
+        p_idx = param
+    elif isinstance(param, str):
+        if param in label_to_idx:
+            p_idx = label_to_idx[param]
+        elif param.startswith("θ") and param[1:].isdigit():
+            p_idx = int(param[1:])
+        elif param.isdigit():
+            p_idx = int(param)
+        else:
+            raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+        if not 0 <= p_idx < output_dim:
+            raise ValueError(f"Parameter index {p_idx} out of range.")
+    else:
+        raise ValueError(f"Cannot interpret parameter identifier: {param!r}")
+    p_label = default_labels[p_idx]
+
+    if space not in ("processed", "log", "physical"):
+        raise ValueError("space must be 'processed', 'log', or 'physical'.")
+
+    if anchor_obs not in ("obs1", "obs2"):
+        raise ValueError(f"anchor_obs must be 'obs1' or 'obs2', not {anchor_obs!r}.")
+
+    # --- resolve case (default: both-clean combo for this obs pair) ---
+    obs_set = {obs1_key, obs2_key}
+    case_to_result = {r["case_name"]: r for r in results}
+    if case is None:
+        both_clean_candidates = []
+        for c, r in case_to_result.items():
+            info = parse_case_name(c)
+            if not (info["kind"] == "combo"
+                    and info.get("noise1") == 0.0
+                    and info.get("noise2") == 0.0):
+                continue
+            selected_c = set(r["selected_observables"])
+            both_clean_candidates.append((c, sorted(selected_c)))
+            if selected_c == obs_set:
+                case = c
+                break
+        if case is None:
+            if both_clean_candidates:
+                raise ValueError(
+                    f"No both-clean combo case whose selected_observables == "
+                    f"{sorted(obs_set)}. Both-clean combos found with other "
+                    f"observables: {both_clean_candidates}. "
+                    f"Pass `case` explicitly or adjust obs1_key/obs2_key."
+                )
+            raise ValueError(
+                f"No both-clean combo case in results (no case with "
+                f"parse_case_name kind='combo' and noise1=noise2=0). "
+                f"Pass `case` explicitly. Cases available: "
+                f"{sorted(case_to_result)}"
+            )
+    if case not in case_to_result:
+        raise ValueError(f"Case {case!r} not in results.")
+    result = case_to_result[case]
+    selected = set(result["selected_observables"])
+    if not obs_set.issubset(selected):
+        missing = obs_set - selected
+        raise ValueError(
+            f"Case {case!r} is missing {sorted(missing)}; the chimera needs "
+            f"both {obs1_key} and {obs2_key} present."
+        )
+
+    idx_arr = np.asarray(idx)
+    n_val = len(idx_arr)
+
+    # --- full n_val x n_val chimera grid: one batched forward pass ---
+    # Row i*n_val+j takes obs1_key from sim i and obs2_key from sim j; any
+    # other observable in the case (there normally isn't one, for these
+    # 2-observable pair sweeps) comes from sim i, matching
+    # make_pair_val_loader_fn's convention. [i, i] reduces to the ordinary
+    # aligned prediction for sim i.
+    cache_key = ("_pair_truth_grid_v1", case, obs1_key, obs2_key, tuple(idx_arr.tolist()))
+    if cache_key not in result:
+        sel_keys_sorted = sorted(result["selected_observables"].keys())
+        cols = []
+        for key in sel_keys_sorted:
+            arr = x_dict[key][idx_arr]
+            if key == obs2_key:
+                expanded = np.tile(arr, (n_val, 1))       # row i*n+j -> arr[j]
+            else:
+                expanded = np.repeat(arr, n_val, axis=0)  # row i*n+j -> arr[i]
+            cols.append(torch.from_numpy(expanded).float())
+        x_all = torch.cat(cols, dim=1)
+
+        model = result["model"].to(device)
+        model.eval()
+        outs = []
+        with torch.no_grad():
+            for i in range(0, x_all.shape[0], all_pairs_batch_size):
+                outs.append(model(x_all[i:i + all_pairs_batch_size].to(device)).cpu())
+        result[cache_key] = torch.cat(outs, dim=0).numpy()  # (n_val*n_val, output_dim), processed space
+
+    preds_flat = result[cache_key]
+
+    def _convert_space(arr):
+        arr = np.array(arr, copy=True)
+        if space == "processed":
+            return arr
+        arr = arr * stds + means
+        if space == "log":
+            return arr
+        arr[:, logflag] = np.exp(arr[:, logflag])
+        return arr
+
+    pred_grid = _convert_space(preds_flat)[:, p_idx].reshape(n_val, n_val)  # [i, j]
+
+    truth_raw = y_vector[idx_arr]
+    if hasattr(truth_raw, "numpy"):
+        truth_raw = truth_raw.numpy()
+    truth = _convert_space(np.asarray(truth_raw, dtype=np.float64))[:, p_idx]
+
+    # --- off-diagonal unique pairs i<j ---
+    i_all, j_all = np.triu_indices(n_val, k=1)
+    if isinstance(n_pairs, str) and n_pairs == "all":
+        i_off, j_off = i_all, j_all
+        n_pairs_desc = f"all unique pairs = {n_val}x{n_val - 1}/2 = {len(i_all)}"
+    elif isinstance(n_pairs, int) and not isinstance(n_pairs, bool):
+        if n_pairs < 1:
+            raise ValueError(f"n_pairs must be >= 1 (got {n_pairs}).")
+        n_avail = len(i_all)
+        if n_pairs > n_avail:
+            raise ValueError(f"n_pairs={n_pairs} exceeds C(n_val,2)={n_avail}.")
+        rng_ = np.random.default_rng(pair_seed)
+        sel = rng_.choice(n_avail, size=n_pairs, replace=False)
+        i_off, j_off = i_all[sel], j_all[sel]
+        n_pairs_desc = f"{n_pairs} sampled pairs (of {n_avail})"
+    else:
+        raise ValueError(f"n_pairs must be 'all' or a positive int, got {n_pairs!r}.")
+
+    # anchor is always the smaller-index sim i; anchor_obs picks which
+    # observable it keeps. pred_grid[row, col] = obs1 from row, obs2 from
+    # col, so "obs1" anchor reads pred_grid[i, j] (anchor keeps obs1) and
+    # "obs2" anchor reads pred_grid[j, i] (anchor keeps obs2, partner j
+    # supplies obs1) -- both already sit in the one n_val x n_val grid
+    # computed above, so switching anchor_obs is free (no extra forward pass).
+    if anchor_obs == "obs1":
+        anchor_obs_key, partner_obs_key = obs1_key, obs2_key
+        y_off = pred_grid[i_off, j_off]
+    else:
+        anchor_obs_key, partner_obs_key = obs2_key, obs1_key
+        y_off = pred_grid[j_off, i_off]
+
+    def short_of(obs_key):
+        return obs_key.split("_")[0]
+
+    short_anchor, short_partner = short_of(anchor_obs_key), short_of(partner_obs_key)
+
+    x_off = truth[i_off]
+    diff_off = truth[j_off] - truth[i_off]     # signed: θ_partner - θ_anchor, NOT absolute
+
+    x_diag = truth
+    y_diag = pred_grid[np.arange(n_val), np.arange(n_val)]
+    n_off = len(x_off)
+
+    # --- auto-scale marker style from point count ---
+    if marker_alpha is None:
+        if n_off <= 200:      marker_alpha = 0.85
+        elif n_off <= 2000:   marker_alpha = 0.55
+        else:                 marker_alpha = 0.35
+    if marker_size is None:
+        if n_off <= 200:      marker_size = 26
+        elif n_off <= 2000:   marker_size = 10
+        else:                 marker_size = 5
+
+    # --- plot ---
+    fig, ax = plt.subplots(figsize=figsize)
+
+    lo = float(min(truth.min(), y_off.min() if n_off else truth.min(), y_diag.min()))
+    hi = float(max(truth.max(), y_off.max() if n_off else truth.max(), y_diag.max()))
+    pad = 0.03 * (hi - lo if hi > lo else 1.0)
+    lo, hi = lo - pad, hi + pad
+
+    if show_diagonal_line:
+        ax.plot([lo, hi], [lo, hi], "--", color="#5F5E5A", lw=1.2, alpha=0.6,
+                zorder=1, label=f"y = x  →  prediction matches θ_{short_anchor} truth")
+
+    vlim = float(np.quantile(np.abs(diff_off), diff_clip_quantile)) if n_off else 1.0
+    vlim = max(vlim, 1e-12)
+    sc = ax.scatter(x_off, y_off, s=marker_size, alpha=marker_alpha, c=diff_off,
+                     cmap=diff_cmap, vmin=-vlim, vmax=vlim, edgecolor="none",
+                     zorder=2, label=f"{n_off} chimera pairs")
+    cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label(f"θ_{short_partner} − θ_{short_anchor}  ({p_label} truth, signed)")
+
+    if show_aligned_points:
+        ax.scatter(x_diag, y_diag, s=star_size, marker="P", facecolor="#F2C14E",
+                   edgecolor="#3C3489", linewidth=0.5, zorder=3,
+                   label=f"{n_val} aligned (own data)")
+
+    ax.set_xlim(lo, hi)
+    ax.set_ylim(lo, hi)
+    ax.set_aspect("equal")
+    ax.grid(alpha=0.25)
+    ax.set_xlabel(f"θ_{short_anchor} truth  ({p_label}, space={space})")
+    ax.set_ylabel(f"prediction — keep {short_anchor}, swap in {short_partner}")
+    # x-axis-is-anchor-truth and the endpoint mapping are already on the
+    # x/y labels -- kept off the title to cut repetition.
+    ax.set_title(
+        f"{p_label}  —  pair-truth scatter: keep {short_anchor}, swap in {short_partner}"
+        f"   |   case: {case}   |   n={n_off}",
+        fontsize=10)
+    ax.legend(fontsize=8, loc="lower right", framealpha=0.9)
+
+    if save_path is not None:
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.savefig(save_path, dpi=200, bbox_inches="tight")
+
+    stats = {
+        "case": case,
+        "anchor_obs": anchor_obs,
+        "anchor_obs_key": anchor_obs_key,
+        "partner_obs_key": partner_obs_key,
+        "obs1_key": obs1_key,
+        "obs2_key": obs2_key,
+        "space": space,
+        "n_val": n_val,
+        "n_pairs_desc": n_pairs_desc,
+        "n_off_diag": n_off,
+        "n_diag": n_val,
+        "x_off": x_off,
+        "y_off": y_off,
+        "diff_off": diff_off,
+        "i_off": i_off,
+        "j_off": j_off,
+        "x_diag": x_diag,
+        "y_diag": y_diag,
     }
     return fig, stats
 
@@ -4776,7 +5163,7 @@ def plot_marginal_posterior_1d(param, sim_idx, cases, *, space="log_partial",
     # Collect (mu, sigma, truth) for this sim, per case
     entries = []
     for r in res_list:
-        mu, sigma, truth = predict_with_uncertainty(r, indices=idx_val, space=space)
+        mu, sigma, truth = predict_with_uncertainty(r, indices=_eval_idx(), space=space)
         entries.append({
             "case": r["case_name"],
             "mu": float(mu[sim_idx, pidx]),
@@ -4835,7 +5222,7 @@ def plot_marginal_posterior_grid(param, cases, *, sim_indices=None, n_sims=6,
     if not res_list:
         raise ValueError("No cases have a trained moment_model.")
 
-    n_val = len(np.asarray(idx_val))
+    n_val = len(np.asarray(_eval_idx()))
     if sim_indices is None:
         rng = np.random.default_rng(seed)
         sim_indices = rng.choice(n_val, size=min(n_sims, n_val), replace=False)
@@ -4888,7 +5275,7 @@ def plot_sigma_by_case_bars(params, cases, *, space="log_partial", results=None,
     # sigma_by_case[case_name] -> [n_params] aggregated σ
     sigma_by_case = {}
     for r in res_list:
-        _, sigma, _ = predict_with_uncertainty(r, indices=idx_val, space=space)
+        _, sigma, _ = predict_with_uncertainty(r, indices=_eval_idx(), space=space)
         sigma_by_case[r["case_name"]] = np.array(
             [reduce_fn(sigma[:, p]) for p in pidx_list]
         )
@@ -4945,7 +5332,7 @@ def plot_pull_distribution(cases, *, space="normalized", results=None,
 
     for i, r in enumerate(res_list):
         ax = axes.flat[i]
-        mu, sigma, truth = predict_with_uncertainty(r, indices=idx_val, space=space)
+        mu, sigma, truth = predict_with_uncertainty(r, indices=_eval_idx(), space=space)
         pull = ((mu - truth) / sigma)[:, param_idxs].reshape(-1)
         pull_clean = pull[np.isfinite(pull)]
         ax.hist(pull_clean, bins=bins, density=True, alpha=0.6,

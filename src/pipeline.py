@@ -236,6 +236,10 @@ def get_case_predictions(result, mode="aligned", perm=None, keys_to_shuffle=None
     This is the single place that runs a case's model forward on the validation
     set. Every plot that wants predictions should call this instead of
     re-running the model.
+
+    space: "processed" (raw model I/O, mean 0 / std 1 -- what the loss trains
+    on), "log" (processed un-standardized, logflag columns still logged), or
+    "physical" (log undone too, via exp() on the logflag columns).
     """
     eval_idx = _eval_indices()
     if perm is None:
@@ -281,13 +285,14 @@ def get_case_predictions(result, mode="aligned", perm=None, keys_to_shuffle=None
 
     pred_np = torch.cat(preds).numpy()
     true_np = torch.cat(trues).numpy()
-    pred_np = pred_np * stds + means
-    true_np = true_np * stds + means
-    if space == "physical":
-        pred_np[:, logflag] = np.exp(pred_np[:, logflag])
-        true_np[:, logflag] = np.exp(true_np[:, logflag])
-    elif space != "log":
-        raise ValueError("space must be 'physical' or 'log'.")
+    if space != "processed":
+        pred_np = pred_np * stds + means
+        true_np = true_np * stds + means
+        if space == "physical":
+            pred_np[:, logflag] = np.exp(pred_np[:, logflag])
+            true_np[:, logflag] = np.exp(true_np[:, logflag])
+        elif space != "log":
+            raise ValueError("space must be 'processed', 'log', or 'physical'.")
 
     cache[cache_key] = (pred_np, true_np)
     return cache[cache_key]

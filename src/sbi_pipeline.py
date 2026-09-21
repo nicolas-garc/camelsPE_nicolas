@@ -582,7 +582,8 @@ def plot_sbi_multi_sim_corner(result, sim_indices, *, n_samples=2000,
 
 
 def plot_sbi_case_overlay_corner(results, sim_idx, *, n_samples=5000, space="log_partial",
-                                   figsize_per_panel=1.8, cmap_name="tab10", case_labels=None):
+                                   figsize_per_panel=1.8, cmap_name="tab10", case_labels=None,
+                                   mode="aligned", perm=None):
     """Overlay posterior samples from several trained CASES at one test sim,
     one color per case. Dual of plot_sbi_multi_sim_corner (which overlays
     several sims for one case) — this overlays several cases for one sim, e.g.
@@ -591,13 +592,22 @@ def plot_sbi_case_overlay_corner(results, sim_idx, *, n_samples=5000, space="log
     results: list of trained result dicts (each needs sbi_posterior).
     case_labels: optional display names, same order as results (defaults to
     each result's case_name).
+    mode/perm: pass "obs1_vs_truth" or "obs2_vs_truth" to see the same
+    individual-vs-combined comparison under the shuffle test (see
+    predict_moments_from_samples). perm is drawn once (if not given) and
+    reused across every case in `results`, so each case is evaluated against
+    the same substituted sim rather than an independently-random one.
     """
     import matplotlib.pyplot as plt
+
+    if mode != "aligned" and perm is None:
+        n_eval = len(np.asarray(_pipeline._eval_indices()))
+        perm = np.random.permutation(n_eval)
 
     per_case = []
     for r in results:
         _, _, truth, samples = predict_moments_from_samples(
-            r, indices=None, n_samples=n_samples, space=space)
+            r, indices=None, n_samples=n_samples, space=space, mode=mode, perm=perm)
         per_case.append((samples[sim_idx], truth[sim_idx]))
     labels = results[0].get("sbi_focus_params") or results[0].get("moment_focus_params") \
              or [f"θ{i}" for i in range(per_case[0][0].shape[-1])]
@@ -626,6 +636,6 @@ def plot_sbi_case_overlay_corner(results, sim_idx, *, n_samples=5000, space="log
                              markersize=9, markeredgewidth=1.6)
 
     _corner_finish(fig, axes, labels)
-    fig.suptitle(f"SBI posterior samples — val sim #{sim_idx}  (real distribution, not Gaussian)",
-                  fontsize=10, y=0.995)
+    fig.suptitle(f"SBI posterior samples — val sim #{sim_idx}  (real distribution, not Gaussian)"
+                  f"{_mode_tag(mode)}", fontsize=10, y=0.995)
     return fig
