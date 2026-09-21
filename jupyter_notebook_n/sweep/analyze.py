@@ -10,7 +10,7 @@
 #   kernelspec:
 #     display_name: py311-main
 #     language: python
-#     name: python3
+#     name: py311-main
 # ---
 
 # %% [markdown]
@@ -20,7 +20,7 @@
 # 1. Setup + load a pair
 # 2. Heatmaps (aligned R², shuffled R², ΔR²)
 # 3. Suggest & set `FOCUS_PARAMS`
-# 4. Per-parameter mean-net plots: predictions, dual curve, bias progression, pair-normalized, shuffle scatter
+# 4. Per-parameter mean-net plots: predictions, dual curve, attractor map, unordered-pair normalized, pair-normalized, shuffle scatter
 # 5. Moment-network plots: marginal posterior 1D+grid, σ bars, calibration pull
 # 6. Cross-pair comparison
 # 7. Save any current figure
@@ -165,26 +165,45 @@ if ctx.r2_matrix_shifted_obs is not None and ctx.r2_matrix_shifted_both is not N
             print(f"[warn] {p}: {e}")
 
 # %% [markdown]
-# ### 4c. Bias progression overlay
-# (pred − true) vs true, one curve per case ordered clean→asym→both-clean→asym→clean
+# ### 4c. Prediction attractor map
+# One panel per param: every noise case becomes a binned mean(pred) vs true
+# curve, so you see how the pred/truth relationship shifts across the case
+# sequence in one view. y=x = perfect info; y=mean(true) = no info (collapsed
+# to the prior mean). The both-clean reference case is drawn bold black.
 
 # %%
 for p in FOCUS_PARAMS:
     try:
-        fig, stats = ctx.plots.plot_bias_progression_overlay(param=p)
+        fig, stats = ctx.plots.plot_prediction_attractor_map(param=p)
         relabel_figure(ctx)
         plt.show()
     except Exception as e:
-        print(f"[warn] plot_bias_progression_overlay({p}): {e}")
+        print(f"[warn] plot_prediction_attractor_map({p}): {e}")
 
 # %% [markdown]
-# ### 4d. Pair-normalized values — one param, one mode
+# ### 4d. Unordered-pair normalized values
+# Like 4e below, but pairs are sampled (not aligned val rows) and normalized
+# by P_norm = (pred − t0)/(t1 − t0) for each unordered sim pair (i,j).
+
+# %%
+for p in FOCUS_PARAMS:
+    try:
+        fig, stats = ctx.plots.plot_param_unordered_pair_normalized_values(
+            param=p, space="processed", min_abs_denom=1.5,
+        )
+        relabel_figure(ctx)
+        plt.show()
+    except Exception as e:
+        print(f"[warn] plot_param_unordered_pair_normalized_values({p}): {e}")
+
+# %% [markdown]
+# ### 4e. Pair-normalized values — one param, one mode
 
 # %%
 PAIR_PARAM = FOCUS_PARAMS[0] if FOCUS_PARAMS else "θ4"
 try:
     ctx.plots.plot_param_pair_normalized_values(
-        PAIR_PARAM, space="log",
+        PAIR_PARAM, space="processed",
         mode="obs2_vs_truth",
         normalize_endpoints="obs1_to_obs2",
     )
@@ -194,7 +213,7 @@ except Exception as e:
     print(f"[warn] plot_param_pair_normalized_values({PAIR_PARAM}): {e}")
 
 # %% [markdown]
-# ### 4e. Side-by-side pair-normalized shuffle scatter
+# ### 4f. Side-by-side pair-normalized shuffle scatter
 
 # %%
 def side_by_side_shuffle_scatter(param):
@@ -205,10 +224,10 @@ def side_by_side_shuffle_scatter(param):
     try:
         ctx.plots.plot_pair_normalized_shuffle_scatter(
             param=param, n_pairs="all", case=None,
-            mode="obs1_vs_truth", color_by_theta1=True)
+            mode="obs1_vs_truth", color_by_theta_diff=True)
         ctx.plots.plot_pair_normalized_shuffle_scatter(
             param=param, n_pairs="all", case=None,
-            mode="obs2_vs_truth", color_by_theta1=True)
+            mode="obs2_vs_truth", color_by_theta_diff=True)
     finally:
         plt.subplots = _orig
     fig.tight_layout()
