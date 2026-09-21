@@ -19,7 +19,8 @@ git clone --depth 1 --single-branch -b hpc-sweep <repo-url> camelsPE && cd camel
 ```
 
 `--depth 1 --single-branch` matters: the repo's history contains old notebooks
-with embedded outputs (~1 GB), while this branch's working tree is only 3.5 MB.
+with embedded outputs, so a full clone transfers ~318 MB to get a 3.5 MB
+working tree. The shallow clone is 6.4 MB.
 If you were sent a `.tar.gz` instead, just unpack it — no git needed.
 
 **2. Set up an environment** (Python 3.11 recommended; see `requirements.txt`)
